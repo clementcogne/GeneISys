@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use this software in your research or project, please cite it as below."
+authors:
+  - family-names: "Cogné"
+    given-names: "Clément"
+title: "GeneISys: An Organic Neuro-Symbolic Engine based on Semantic Physics"
+version: 0.0.95-alpha
+date-released: 2025-11-28
+url: "https://github.com/clementcogne/GeneISys"
+license: MIT
+keywords:
+  - artificial-intelligence
+  - neuro-symbolic
+  - semantic-physics
+  - white-box-ai
+  - vibe-coding
