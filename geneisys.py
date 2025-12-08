@@ -4087,7 +4087,7 @@ if __name__ == "__main__":
     Nb_DIM = 4096 #tested for: 64, 128, 256, 512, 1024, 2048, 4096
     # N11: CONFIGURATION DE PRÉCISION (Point 3)
     # Options: "INT8", "FP16", "FP32"
-    strPRECISION_MODE = "INT8"
+    strPRECISION_MODE = "FP32"
     boolForceCPU = False # false for CUDA auto-detection and True to force CPU (CUDA unactivation)
     #boolForceCPU = True
     str_lang = "fr" 
@@ -4139,3 +4139,4 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n [SYSTEME] Arrêt d'urgence.")
             brain.sleep()
+
