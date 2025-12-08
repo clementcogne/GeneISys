@@ -4,8 +4,8 @@ authors:
   - family-names: "Cogné"
     given-names: "Clément"
 title: "GeneISys: An Organic Neuro-Symbolic Engine based on Semantic Physics"
-version: 0.0.95-alpha
-date-released: 2025-11-28
+version: 0.0.96-alpha
+date-released: 2025-12-08
 url: "https://github.com/clementcogne/GeneISys"
 license: MIT
 keywords:
