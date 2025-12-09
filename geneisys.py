@@ -64,7 +64,7 @@ author's availability. There is no pressure or timeline for updates.
 ================================================================================
 """
 
-strVersion = "0.0.96_STABLE_alpha"
+strVersion = "0.0.96_12_STABLE_alpha"
 
 
 import torch
@@ -80,8 +80,34 @@ import random
 import threading
 import queue
 import gc 
+import multiprocessing
 from collections import Counter
 from safetensors.torch import save_file, load_file
+import builtins
+
+
+
+
+
+
+
+
+
+
+
+
+# --- 0. SYSTEME IO SECURISE (Global Lock) ---
+#CONSOLE_LOCK = threading.Lock()
+#_original_print = print
+
+#def safe_print(*args, **kwargs):
+#    """Force l'affichage immédiat et empêche le mélange des lettres entre threads."""
+#    with CONSOLE_LOCK:
+#        _original_print(*args, **kwargs, flush=True)
+
+# Surcharge globale : Tous les 'print' du code deviennent thread-safe
+#print = safe_print
+
 
 # --- DEPENDANCES ---
 try:
@@ -125,6 +151,9 @@ except Exception as e:
 
 # --- CONFIGURATION (MVP94.5 - PERFORMANCE) ---
 class GenesisConfig:
+    # --- REGISTRE DES THREADS ACTIFS (Pattern Pool) ---
+    RUNNING_THREADS = []
+
     def __init__(self, dim=4096, shard_count=5, PrecisionType="FP32", ForceCPU = False,str_version=f'GENEISIS MVP{strVersion} (Performance & Hardening)'):
         if ForceCPU:
             self.DEVICE = torch.device("cpu")
@@ -277,6 +306,12 @@ class GenesisConfig:
         self.INGEST_DEFAULT_EPOCHS = 1
         self.EPSILON = 1e-5
         
+        # --- MVP97 : TURBO PIPELINE ---
+        self.ENABLE_MULTITHREADING = True  # Active le Bridge Léger
+        self.INGESTION_QUEUE_SIZE = 50     # Backpressure (Max batchs en attente)
+        self.INGESTION_TIMEOUT = 0.5       # Temps d'attente max des workers
+        self.BRIDGE_SYNC_TIMEOUT = 20.0    # Timeout augmenté pour la stabilité
+        
         # --- NOUVEAU : CONSTANTES PHYSIQUES CENTRALISÉES (Patch Stabilité) ---
         self.PHYSICS_EPSILON = 0.1          # Évite la division par zéro (Distance)
         self.SIMILARITY_POWER = 3.0         # Facteur d'amplification de la similarité
@@ -307,11 +342,107 @@ class GenesisConfig:
             optimal_chunk = min(optimal_chunk, int(TARGET_ELEMENTS / self.DIM_SIZE))
         self.PHYSICS_CHUNK_SIZE = max(128, optimal_chunk)
         self.BATCH_UPDATE_CHUNK_SIZE = max(1024, self.DIM_SIZE // 2)
+        
+        
+    @classmethod
+    def register(cls, thread_instance):
+        """Enregistre un thread pour qu'il soit nettoyé à la fin."""
+        if thread_instance not in cls.RUNNING_THREADS:
+            cls.RUNNING_THREADS.append(thread_instance)
+
+    @classmethod
+    def unregister(cls, thread_instance):
+        """Retire un thread de la liste (s'il est stoppé manuellement)."""
+        if thread_instance in cls.RUNNING_THREADS:
+            cls.RUNNING_THREADS.remove(thread_instance)
+
+    @classmethod
+    def global_shutdown(cls):
+        """Arrêt propre de TOUS les threads enregistrés, quels qu'ils soient."""
+        print(f"\n [SYSTEME] Nettoyage global ({len(cls.RUNNING_THREADS)} threads actifs)...")
+        for t in cls.RUNNING_THREADS:
+            try:
+                if hasattr(t, 'stop'): 
+                    t.stop() # Appel de la méthode d'arrêt douce
+                if t.is_alive():
+                    t.join(timeout=1.0) # Attente
+            except Exception as e:
+                print(f" [WARN] Erreur lors de l'arrêt du thread {t.name}: {e}")
+        cls.RUNNING_THREADS.clear()
 
 #first call for function declaration when CFG.X is a default value
 CFG = GenesisConfig()
 
 
+# ==============================================================================
+#  SYSTEME I/O ASYNCHRONE (LOGGER BRIDGE)
+# ==============================================================================
+class GenesisAsyncLogger(threading.Thread):
+    def __init__(self):
+        super().__init__(name="GenesisLogger", daemon=True)
+        self.log_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.original_print = builtins.print 
+        GenesisConfig.register(self) # Je m'enregistre dans le pool
+
+    def run(self):
+        while not self.stop_event.is_set() or not self.log_queue.empty():
+            try:
+                msg = self.log_queue.get(timeout=0.05)
+                self.original_print(msg)
+                
+                # --- PREUVE DU BUFFER ---
+                # qsize() nous dit combien d'AUTRES messages attendent derrière.
+                # Si qsize > 0, cela prouve que le Main Thread a été plus vite que l'affichage.
+                #taille_buffer = self.log_queue.qsize()
+                #prefixe = f"[BUFFER: {taille_buffer}]" if taille_buffer > 0 else "[DIRECT]"
+                #self.original_print(f"{prefixe} {msg}")
+                # -------------------------
+                
+                
+                
+                # CRUCIAL : Signale que ce message a été traité
+                self.log_queue.task_done() 
+            except queue.Empty:
+                continue
+    
+    def log(self, *args, **kwargs):
+        msg = " ".join(map(str, args))
+        self.log_queue.put(msg)
+
+    def wait_until_empty(self):
+        """
+        Bloque l'appelant jusqu'à ce que tous les messages en attente
+        soient réellement affichés à l'écran.
+        """
+        self.log_queue.join()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.is_alive():
+            self.join(timeout=2.0)
+
+class PrintRedirector:
+    """
+    Context Manager intelligent.
+    1. Capture les prints -> Queue (Rapide)
+    2. À la sortie, attend que la Queue soit vide (Propre)
+    """
+    def __init__(self, logger_instance):
+        self.logger = logger_instance
+        self.original_print = builtins.print
+
+    def __enter__(self):
+        builtins.print = self.logger.log
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # 1. D'abord, on remet le print normal (sécurité)
+        builtins.print = self.original_print
+        
+        # 2. Ensuite, on force le Main Thread à attendre que le Logger ait fini
+        #    de "vomir" tout ce qu'il a accumulé pendant le bloc.
+        self.logger.wait_until_empty()
 
     
     
@@ -1929,6 +2060,136 @@ HARDWARE_REGISTRY = {
     "OP_CTX": OpContext(), "OP_LBL": OpLabel(), "OP_SEQ": OpSequence()
 }
 
+
+class GenesisBridge(threading.Thread):
+    """
+    [BRIDGE LEGER - PRODUCTION]
+    Classe Mère pour les workers asynchrones basés sur Threading (Zero-Copy).
+    Gère le cycle de vie, la sécurité et le flux de données.
+    """
+    def __init__(self, name, brain, input_q=None, output_q=None):
+        super().__init__(name=name)
+        self.brain = brain
+        self.in_q = input_q if input_q else queue.Queue(maxsize=100)
+        self.out_q = output_q if output_q else queue.Queue(maxsize=CFG.INGESTION_QUEUE_SIZE)
+        self.daemon = True # Meurt avec le programme principal
+        self.stop_event = threading.Event()
+        GenesisConfig.register(self) # Je m'enregistre dans le pool
+
+    def stop(self):
+        self.stop_event.set()
+
+    def process_data(self, raw_data):
+        """Méthode abstraite à surcharger par les implémentations."""
+        raise NotImplementedError
+
+    def run(self):
+        print(f" [BRIDGE] Démarrage du worker léger : {self.name}")
+        while not self.stop_event.is_set():
+            try:
+                # 1. Attente non-bloquante (avec timeout pour vérifier le stop_event)
+                raw_data = self.in_q.get(timeout=CFG.INGESTION_TIMEOUT)
+                
+                # --- MODIFICATION : GESTION DU MARQUEUR ---
+                if raw_data == "__SYNC_MARKER__":
+                    # On renvoie le marqueur tel quel pour dire "J'ai fini tout ce qu'il y avait avant"
+                    self.out_q.put({"type": "MARKER"})
+                    continue
+                # ------------------------------------------
+                
+                # 2. Traitement (Tokenization/Encodage...)
+                # C'est ici que le GIL est relâché par les libs Rust/C++
+                result = self.process_data(raw_data)
+                
+                if result is not None:
+                    # 3. Envoi vers le GPU (Peut bloquer si le GPU est saturé -> Backpressure)
+                    self.out_q.put(result, timeout=5.0)
+                    
+            except queue.Empty:
+                continue
+            except queue.Full:
+                print(f" [WARN] Bridge {self.name} saturé (GPU trop lent).")
+                continue
+            except Exception as e:
+                print(f" [ERR] Bridge {self.name} crash: {e}")
+
+class TextIngestionBridge(GenesisBridge):
+    """
+    Ouvrier spécialisé dans la préparation du texte.
+    Transforme (Str) -> (Tenseurs Prêts)
+    """
+    def process_data(self, text_batch):
+        # text_batch est une liste de lignes brutes
+        
+        for line in text_batch:
+            # 1. Logique de découpage LEGACY (Idem _process_sequential_legacy)
+            # On remplace "." par " ." puis on split sur " ."
+            # Cela a deux effets : séparer les phrases ET supprimer le point des tokens.
+            sentences = line.replace(".", " .").split(" .")
+            
+            for sent in sentences:
+                clean_sent = sent.strip()
+                if not clean_sent: continue
+                
+                words = clean_sent.split()
+                if not words: continue
+                
+                # 2. Encodage d'UNE SEULE phrase
+                # On n'attend pas d'avoir 128 mots, on envoie la phrase telle quelle.
+                # C'est vital pour que la physique ne mélange pas "Le Chat..." et "Le Chien..."
+                vecs, weights = self.brain.encoder.encode_batch_fast(words)
+                
+                packet = {
+                    "type": "TEXT_BATCH",
+                    "vecs": vecs,
+                    "weights": weights,
+                    "tokens": words, # Ici, "words" ne contient plus de point "."
+                    "count": len(vecs)
+                }
+                
+                # 3. Envoi au Stream
+                # Le Stream va traiter ce paquet, vider son buffer, et être prêt pour la suite.
+                self.out_q.put(packet)
+            
+        return None
+
+class PrototypeHeavyBridge(multiprocessing.Process):
+    """
+    [BRIDGE LOURD - PROTOTYPE TEST]
+    Basé sur Multiprocessing (Isolation Totale).
+    Sert à valider l'architecture hybride pour le futur (Cluster/Distribué).
+    
+    Note: On ne passe PAS 'brain' ici car il n'est pas picklable (Pointeurs CUDA).
+    On simule un traitement externe.
+    """
+    def __init__(self, input_q, output_q):
+        super().__init__()
+        self.in_q = input_q
+        self.out_q = output_q
+        self.running = multiprocessing.Event()
+        self.running.set()
+
+    def stop(self):
+        self.running.clear()
+
+    def run(self):
+        print(f" [HEAVY-BRIDGE] Démarrage Processus Isolé (PID: {os.getpid()})")
+        while self.running.is_set():
+            try:
+                # Récupération depuis le monde extérieur
+                data = self.in_q.get(timeout=1.0)
+                
+                # Simulation d'un traitement lourd (ex: OCR, Vision, Réseau)
+                # Ici on fait juste un "Pass-Through" avec marquage
+                processed = f"[HEAVY_PROCESSED] {data}"
+                
+                # Renvoi vers le bridge léger
+                self.out_q.put(processed)
+            except Exception: # Queue Empty ou autre
+                continue
+        print(" [HEAVY-BRIDGE] Arrêt.")
+
+
 class SensoryStream:
     def __init__(self, brain):
         self.brain = brain
@@ -1944,49 +2205,152 @@ class SensoryStream:
         self.time_step = 0
         self.weights_buffer = torch.zeros(self.MAX_LEN, dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         self.layer_type = None
-
-    def receive_sequence(self, token_list_raw, layer_type=CFG.LAYER_CONCEPT, mode="REALITY", trust=1.0):
         
+        # --- MVP97 : INITIALISATION BRIDGE ---
+        self.bridge = None
+        if CFG.ENABLE_MULTITHREADING:
+            self.bridge = TextIngestionBridge("TextWorker_1", brain)
+            self.bridge.start()
+            print(" [STREAM] Mode Turbo Activé (Threaded Pipeline).")
+
+    def stop(self):
+        if self.bridge: self.bridge.stop()
+
+    def receive_sequence(self, token_list_raw, layer_type=CFG.LAYER_CONCEPT, mode="REALITY", trust=1.0, sync_wait=False):
+        """
+        [FIX 0.0.96_04] Implémentation du Sentinel Pattern.
+        Garantit que 100% des données sont traitées avant de rendre la main.
+        """
+        if isinstance(token_list_raw, str): token_list_raw = [token_list_raw]
+        
+        self.current_context_mode = mode
+        self.current_trust_level = trust
+        self.layer_type = layer_type
+
+        # --- CAS 1 : THREADING ACTIF ---
+        if self.bridge and (mode == "TRAINING" or mode == "REALITY"):
+            self.bridge.in_q.put(token_list_raw)
+            
+            if sync_wait:
+                # On envoie le marqueur
+                self.bridge.in_q.put("__SYNC_MARKER__")
+                
+                # On attend le retour
+                while True:
+                    try:
+                        packet = self.bridge.out_q.get(timeout=10.0) # Timeout généreux
+                        if packet["type"] == "MARKER":
+                            break # C'est fini pour ce lot
+                            
+                        # --- SURCHARGE DYNAMIQUE DU PRINT ---
+                        # Pendant cette exécution, tout 'print' (même dans OpAttribution)
+                        # partira dans le thread Logger sans bloquer le calcul.
+                        with PrintRedirector(LOGGER):
+                            self._consume_physics_packet(packet)
+                        # ------------------------------------
+                        #self._consume_physics_packet(packet)
+                    except queue.Empty:
+                        print(" [WARN] Bridge Timeout.")
+                        break
+            
+        # --- CAS 2 : SÉQUENTIEL (Fallback) ---
+        else:
+            self._process_sequential_legacy(token_list_raw)
+            
+    
+    def flush(self):
+        """Indispensable : Attend que le Worker ait fini son travail."""
+        if not self.bridge: return
+        
+        print(" [STREAM] Finalisation (Flush)...")
+        # Tant qu'il reste du texte à lire OU des paquets à traiter
+        while not self.bridge.in_q.empty() or not self.bridge.out_q.empty():
+            self.process_pending()
+            time.sleep(0.01) # On laisse le CPU respirer
+        print(" [STREAM] Sync terminée.")
+    
+    
+    def process_pending(self):
+        """
+        Vide la file d'attente du Bridge et exécute la physique + prints.
+        """
+        if not self.bridge: return
+
+        # Tant qu'il y a des paquets prêts dans la sortie du thread
+        while not self.bridge.out_q.empty():
+            try:
+                packet = self.bridge.out_q.get_nowait()
+                if packet["type"] == "TEXT_BATCH":
+                    # C'est ici que _process_buffer_vectorized est appelé
+                    # et que tes prints ("Création Molécule...") vont s'afficher !
+                    self._consume_physics_packet(packet)
+            except queue.Empty:
+                break
+
+    def _consume_physics_packet(self, packet):
+        """Exécute la physique sur un paquet pré-calculé (GPU Only)."""
+        vecs = packet["vecs"]
+        weights = packet["weights"]
+        words = packet["tokens"]
+        n = packet["count"]
+        
+        # --- FIX CRASH SIZE MISMATCH ---
+        # Si le paquet reçu est plus grand que le buffer interne (MAX_LEN), on tronque.
+        # Idéalement, le worker devrait découper en amont, mais ceci est la sécurité ultime.
+        if n > self.MAX_LEN:
+            print(f" [WARN] Packet trop gros ({n} > {self.MAX_LEN}). Tronqué.")
+            n = self.MAX_LEN
+            vecs = vecs[:n]
+            weights = weights[:n]
+            words = words[:n]
+        # -------------------------------
+        
+        # Copie dans les buffers (Très rapide, transfert GPU<->GPU ou RAM<->GPU)
+        self.active_count = n
+        self.vecs_buffer[:n] = vecs
+        self.weights_buffer[:n] = weights
+        self.positions_buffer[:n] = torch.arange(n, device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
+        # Mise à jour des tokens pour la logique sémantique
+        # (Attention: ceci est lent en Python pur, point d'opti futur)
+        for i, w in enumerate(words):
+             if i < self.MAX_LEN: self.word_tokens[i] = w
+
+        # Mise à jour mémoire (Learning)
+        self.brain.memory.update_batch(words, vecs)
+        
+        # Physique
+        self._process_buffer_vectorized()
+        
+        # Reset
+        self.active_count = 0
+
+    def _process_sequential_legacy(self, token_list_raw):
+        # ... (C'est le code de l'ancienne fonction receive_sequence que vous déplacez ici) ...
+        # Copiez-collez ici tout le contenu de votre ancienne fonction receive_sequence
+        # Pour ne pas casser le mode interactif "Chat".
         if isinstance(token_list_raw, list):
             text_block = " ".join(token_list_raw) 
         else:
             text_block = token_list_raw
         
-        # Stockage du contexte pour ce cycle
-        self.current_context_mode = mode
-        self.current_trust_level = trust
-        
-        
-        
         sentences = text_block.replace(".", " .").split(" .") 
         for sent in sentences:
             if not sent.strip(): continue
-            if TOKENIZERS_AVAILABLE:
-                words = sent.strip().split() 
-            else:
-                words = sent.strip().split()
-
-            # MODIFICATION : Récupération des poids
-            word_vecs, word_weights = self.brain.encoder.encode_batch_fast(words)
+            words = sent.strip().split() 
+            vecs, weights = self.brain.encoder.encode_batch_fast(words)
             n_words = len(words)
             if n_words > self.MAX_LEN:
-                 n_words = self.MAX_LEN
-                 words = words[:n_words]
-                 word_vecs = word_vecs[:n_words]
+                 n_words = self.MAX_LEN; words = words[:n_words]; vecs = vecs[:n_words]; weights = weights[:n_words]
 
-            self.layer_type = layer_type
             self.active_count = n_words
-            self.vecs_buffer[:n_words] = word_vecs.to(dtype=CFG.COMPUTE_DTYPE)
-            self.weights_buffer[:n_words] = word_weights.to(dtype=CFG.COMPUTE_DTYPE) # <-- Nouveau
+            self.vecs_buffer[:n_words] = vecs.to(dtype=CFG.COMPUTE_DTYPE)
+            self.weights_buffer[:n_words] = weights.to(dtype=CFG.COMPUTE_DTYPE)
             self.positions_buffer[:n_words] = torch.arange(n_words, device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
-            self.word_tokens[:n_words] = words 
+            for i, w in enumerate(words): self.word_tokens[i] = w # Fallback manuel
             
-            self.brain.memory.update_batch(words, word_vecs)
+            self.brain.memory.update_batch(words, vecs)
             self._process_buffer_vectorized()
             self.active_count = 0
-            self.time_step = 0
-            
-        
 
     def _generate_attention_mask(self, n):
         mask = torch.ones((n, n), device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
@@ -2650,10 +3014,13 @@ class UnifiedBrain:
         loc.add_child(inst)
         return inst
 
-    def perceive(self, t, mode="REALITY", trust=1.0): 
+    def perceive(self, t, mode="REALITY", trust=1.0, sync_wait = CFG.ENABLE_MULTITHREADING): 
         # Point d'entrée "Trust-Aware"
         layer_target = CFG.LAYER_REALITY if mode == "REALITY" else CFG.LAYER_CONCEPT
-        self.stream.receive_sequence(t, layer_type=layer_target, mode=mode, trust=trust)
+        # --- FIX TESTS ---
+        # Si on utilise le threading, on VEUT attendre le résultat pour les tests unitaires
+
+        self.stream.receive_sequence(t, layer_type=layer_target, mode=mode, trust=trust, sync_wait=sync_wait)
         
     def _collect_node_data(self, node, path_id, tensor_dict, json_dict, exclude=None):
         if exclude and node.name == exclude: return 
@@ -3162,44 +3529,66 @@ class GenesisBootloader:
     def __init__(self, config, brain): self.cfg = config; self.brain = brain
     def train_from_corpus_file(self, file_path, epochs=None, layer_type=CFG.LAYER_CONCEPT):
         if epochs is None: epochs = self.cfg.INGEST_DEFAULT_EPOCHS
-        print(f"\n [TRAINING] Ingestion massive (N11 Turbo): {file_path}")
-        if not os.path.exists(file_path): print(f" [ERR] Fichier introuvable: {file_path}"); return
+        print(f"\n [TRAINING] Ingestion Contrôlée (Threaded + Logs): {file_path}")
+        if not os.path.exists(file_path): print(f" [ERR] Fichier introuvable."); return
         
-        CHUNK_LINES = 500 
+        CHUNK_LINES = 100 
         batch_lines = []
         total_lines = 0
-        start_time = time.time()
+        start_global = time.time()
         
         for epoch in range(epochs):
             print(f" --- EPOQUE {epoch + 1}/{epochs} ---")
             try:
-                # MVP94.5: Lecture Chunked Optimisée
                 with open(file_path, 'r', encoding='utf-8') as f:
                     while True:
-                        lines = f.readlines(10000) 
+                        lines = f.readlines(1000) 
                         if not lines: break
+                        
                         for line in lines:
                             if not line.strip(): continue
                             batch_lines.append(line.strip().replace(".", " .")) 
                             total_lines += 1
+                            
                             if len(batch_lines) >= CHUNK_LINES:
-                                self.brain.stream.receive_sequence(batch_lines, layer_type, mode="TRAINING", trust=1.0) 
+                                # [CRITIQUE] sync_wait=True force l'attente du résultat
+                                self.brain.stream.receive_sequence(
+                                    batch_lines, 
+                                    layer_type, 
+                                    mode="TRAINING", 
+                                    trust=1.0, 
+                                    sync_wait=True  # <--- CRUCIAL
+                                )
                                 batch_lines = []
+                                
                             if total_lines % self.cfg.INGEST_SLEEP_INTERVAL == 0: 
-                                print(f" [TRAINING] ... {total_lines} lignes traitées.")
+                                print(f" [Check] {total_lines} lignes...")
                                 self.brain.sleep()
-                if batch_lines: self.brain.stream.receive_sequence(batch_lines, layer_type, mode="TRAINING", trust=1.0)
-            except Exception as e: print(f" [ERR READ] {e}")
-        end_time = time.time(); print(f" [TRAINING] Terminé en {end_time - start_time:.2f}s"); self.brain.sleep()
+                                
+                if batch_lines: 
+                    self.brain.stream.receive_sequence(batch_lines, layer_type, mode="TRAINING", trust=1.0, sync_wait=True)
+                    
+            except Exception as e: print(f" [ERR] {e}")
+        
+        # Le flush est moins critique ici grâce au sync_wait, mais on le garde par sécurité
+        self.brain.stream.flush()
+        print(f" [TRAINING] Terminé en {time.time() - start_global:.2f}s."); self.brain.sleep()
         
     def import_external_vectors(self, file_path):
         print(f"\n [IMPORT] Greffe de vecteurs: {file_path}")
         if not os.path.exists(file_path): return
         try:
             source_dim = 0
-            with open(file_path, 'r', encoding='utf-8') as f: source_dim = len(f.readline().strip().split()) - 1
+            # Correction Syntaxe Python (Pas de one-liner sur try/with)
+            with open(file_path, 'r', encoding='utf-8') as f:
+                header = f.readline().strip().split()
+                source_dim = len(header) - 1
+            
+            if source_dim <= 0: return
+
             projection_matrix = F.normalize(torch.randn(source_dim, self.cfg.DIM_SIZE).to(self.cfg.DEVICE), p=2, dim=0, eps=CFG.EPSILON)
             count = 0
+            
             with open(file_path, 'r', encoding='utf-8') as f:
                 for line in f:
                     parts = line.strip().split(); word = parts[0]; vals = [float(x) for x in parts[1:]]
@@ -3255,6 +3644,8 @@ class GenesisDiagnostic:
         self.test_scalability()
         self.test_quantization_quality()
         self.test_hypothesis_acceptance()
+        self.test_bridge_architecture()
+        self.test_hybrid_bridge_chaining()
         print("\n=== Fin Diagnostic ===")
     
     def test_precision_mode(self):
@@ -3666,10 +4057,18 @@ class GenesisDiagnostic:
         print("\n--- 23. TEST VITESSE INGESTION (BATCH vs SEQ) ---")
         dummy_corpus = ["Le feu est chaud ."] * 200
         start_batch = time.time()
-        self.brain.stream.receive_sequence(dummy_corpus, mode="TRAINING")
+        
+        # On force sync_wait=True pour que la mesure de temps inclue le travail du thread
+        self.brain.stream.receive_sequence(dummy_corpus, mode="TRAINING", sync_wait=True)
+        
         end_batch = time.time()
-        rate_batch = 200 / (end_batch - start_batch)
-        print(f" > Batch (N10 Stream) : {rate_batch:.1f} phrases/sec")
+        elapsed = end_batch - start_batch
+        
+        # [FIX ZERO DIVISION] Sécurité si < 1ms (Code trop rapide ou Timer Windows imprécis)
+        if elapsed < 0.001: elapsed = 0.001
+            
+        rate_batch = 200 / elapsed
+        print(f" > Batch (N10 Stream) : {rate_batch:.1f} phrases/sec (Temps: {elapsed:.4f}s)")
         if rate_batch > 300: print(" [SUCCESS] Vitesse N10 validée.")
 
     def test_tokenizer_performance(self):
@@ -4081,6 +4480,84 @@ class GenesisDiagnostic:
                 print(" [FAIL] Hypothèse non traitée (Reste en suspens).")
         else:
             print(" [ERR] Échec création hypothèse.")
+            
+            
+    def test_bridge_architecture(self):
+        print("\n--- 36. TEST ARCHITECTURE BRIDGE (MVP97) ---")
+        
+        # Test 1 : Bridge Léger (Production)
+        print(" > Test du Bridge Léger (Threading)...")
+        if self.brain.stream.bridge:
+            # On injecte manuellement
+            test_phrase = ["Le", "Turbo", "est", "rapide"]
+            self.brain.stream.bridge.in_q.put(test_phrase)
+            time.sleep(0.1) # Laisser le temps au thread
+            
+            if not self.brain.stream.bridge.out_q.empty():
+                packet = self.brain.stream.bridge.out_q.get()
+                print(f" [SUCCESS] Packet reçu du Thread Worker (Taille: {packet['count']})")
+                print(f"           Type Tenseur: {packet['vecs'].device}")
+            else:
+                print(" [FAIL] Le Bridge Léger n'a rien renvoyé.")
+        else:
+            print(" [INFO] Multithreading désactivé dans la config.")
+
+    def test_hybrid_bridge_chaining(self):
+        print("\n--- 37. TEST HYBRIDE (HEAVY -> LIGHT CHAIN) ---")
+        print(" > Simulation d'un pipeline distribué...")
+        
+        # Files d'attente pour le processus lourd (Picklable)
+        mp_ctx = multiprocessing.get_context("spawn") # Sécurité Windows
+        heavy_in = mp_ctx.Queue()
+        heavy_out = mp_ctx.Queue()
+        
+        # Démarrage du processus lourd
+        heavy_bridge = PrototypeHeavyBridge(heavy_in, heavy_out)
+        heavy_bridge.start()
+        
+        try:
+            # 1. Injection dans le Lourd (Ex: Donnée brute externe)
+            heavy_in.put("Data_Distante")
+            
+            # 2. Attente traitement Lourd
+            # [CORRECTION] Augmentation du timeout (2s -> 15s)
+            # Le démarrage d'un processus spawn prend du temps (imports PyTorch/Cuda)
+            print(" > Attente du Heavy Bridge (Warmup)...")
+            processed_data = heavy_out.get(timeout=CFG.BRIDGE_SYNC_TIMEOUT)
+            print(f" > Reçu du Heavy Bridge: '{processed_data}'")
+            
+            # 3. Injection dans le Léger (Le "Chainage")
+            # Le main thread fait le pont entre la Queue MP et la Queue Thread
+            if self.brain.stream.bridge:
+                # On simule que la donnée traitée devient une phrase
+                fake_sentence = [processed_data, "est", "reçu"]
+                
+                # On utilise la nouvelle méthode process_data qui attend une liste de lignes
+                # Donc on encapsule notre phrase dans une liste de lignes (ici une seule ligne)
+                fake_line = " ".join(fake_sentence) + " ."
+                self.brain.stream.bridge.in_q.put([fake_line])
+                
+                # Vérif (On laisse un peu de temps au thread léger)
+                time.sleep(0.5)
+                
+                # On vérifie si quelque chose sort (Succès)
+                if not self.brain.stream.bridge.out_q.empty():
+                    # On vide pour nettoyer
+                    while not self.brain.stream.bridge.out_q.empty():
+                        self.brain.stream.bridge.out_q.get()
+                    print(" [SUCCESS] Chaîne Complète : Heavy(Process) -> Main -> Light(Thread) -> GPU Validée.")
+                else:
+                    print(" [FAIL] Rupture de chaîne au niveau du Light Bridge (Rien reçu).")
+            else:
+                 print(" [INFO] Pas de bridge léger actif (Test partiel).")
+            
+        except Exception as e:
+            # On affiche repr(e) pour voir l'erreur exacte (souvent 'Empty')
+            print(f" [FAIL] Erreur chaîne hybride: {repr(e)}")
+        finally:
+            heavy_bridge.stop()
+            heavy_bridge.join(timeout=1.0)
+            if heavy_bridge.is_alive(): heavy_bridge.terminate()
 
 if __name__ == "__main__":
     
@@ -4100,43 +4577,57 @@ if __name__ == "__main__":
     #RUN_MODE = "INFERENCE" 
     
     CFG = GenesisConfig(dim=Nb_DIM, PrecisionType = strPRECISION_MODE, ForceCPU=boolForceCPU)
+    # --- INSTANCE GLOBALE LOGGER ---
+    LOGGER = GenesisAsyncLogger()
+    LOGGER.start()
     
-    if RUN_MODE == "DIAGNOSTIC":
-        CFG.BASE_MEM_DIR = CFG.BASE_MEM_DIR + "_DIAG"
-    
-    brain = UnifiedBrain(str_lang, boolResetBase)
-    bootloader = GenesisBootloader(CFG, brain)
-    diagnostics = GenesisDiagnostic(brain)
-    if RUN_MODE == "DIAGNOSTIC":
-        diagnostics.run_all()
-    elif RUN_MODE == "LIFE_LOOP":
-        brain.life_cycle()
-    elif RUN_MODE == "TRAINING_FILE":
-        bootloader.train_from_corpus_file("genesis_curriculum.txt", epochs=5)
-    elif RUN_MODE == "IMPORT_MODEL":
-        bootloader.import_external_vectors("fake_vectors.txt")
-    elif RUN_MODE == "INFERENCE":
-        print("\n [INFERENCE] Mode Interactif Activé (Ctrl+C pour quitter).")
-        brain.associative_memory._refresh_lexicon()
-        try:
-            while True:
-                u = input(" > Vous: ")
-                if u.lower() in ["q", "exit", "quit"]: break
-                if not u.strip(): continue
-                if u.lower().startswith("comment est "):
-                    subj = u.lower().replace("comment est ", "").replace("?", "").strip()
-                    print(f" > GENESIS (Mémoire Narrative): {brain.ask_narrative(subj)}")
-                    continue
-                phrase_traitee = u if u.endswith(".") else u + " ."
-                brain.perceive(phrase_traitee)
-                mots = u.replace(".", "").split()
-                if mots:
-                    vec_pensee = torch.zeros(brain.dim).to(CFG.DEVICE)
-                    for m in mots: vec_pensee += brain.encoder.encode_word(m)
-                    vec_pensee = F.normalize(vec_pensee, p=2, dim=0, eps=CFG.EPSILON)
-                    reponse = brain.generate_response(vec_pensee)
-                    print(f" > GENESIS (Association): {reponse}")
-        except KeyboardInterrupt:
-            print("\n [SYSTEME] Arrêt d'urgence.")
-            brain.sleep()
-
+    try:
+        if RUN_MODE == "DIAGNOSTIC":
+            CFG.BASE_MEM_DIR = CFG.BASE_MEM_DIR + "_DIAG"
+        
+        brain = UnifiedBrain(str_lang, boolResetBase)
+        bootloader = GenesisBootloader(CFG, brain)
+        diagnostics = GenesisDiagnostic(brain)
+        if RUN_MODE == "DIAGNOSTIC":
+            diagnostics.run_all()
+        elif RUN_MODE == "LIFE_LOOP":
+            brain.life_cycle()
+        elif RUN_MODE == "TRAINING_FILE":
+            bootloader.train_from_corpus_file("genesis_curriculum.txt", epochs=5)
+        elif RUN_MODE == "IMPORT_MODEL":
+            bootloader.import_external_vectors("fake_vectors.txt")
+        elif RUN_MODE == "INFERENCE":
+            print("\n [INFERENCE] Mode Interactif Activé (Ctrl+C pour quitter).")
+            brain.associative_memory._refresh_lexicon()
+            try:
+                while True:
+                    u = input(" > Vous: ")
+                    if u.lower() in ["q", "exit", "quit"]: break
+                    if not u.strip(): continue
+                    if u.lower().startswith("comment est "):
+                        subj = u.lower().replace("comment est ", "").replace("?", "").strip()
+                        print(f" > GENESIS (Mémoire Narrative): {brain.ask_narrative(subj)}")
+                        continue
+                    phrase_traitee = u if u.endswith(".") else u + " ."
+                    brain.perceive(phrase_traitee)
+                    mots = u.replace(".", "").split()
+                    if mots:
+                        vec_pensee = torch.zeros(brain.dim).to(CFG.DEVICE)
+                        for m in mots: vec_pensee += brain.encoder.encode_word(m)
+                        vec_pensee = F.normalize(vec_pensee, p=2, dim=0, eps=CFG.EPSILON)
+                        reponse = brain.generate_response(vec_pensee)
+                        print(f" > GENESIS (Association): {reponse}")
+            except KeyboardInterrupt:
+                print("\n [SYSTEME] Arrêt d'urgence.")
+                brain.sleep()
+        
+    except Exception as e:
+        print(f"\n [CRASH] Erreur fatale : {e}")
+        traceback.print_exc()
+            
+    finally:
+        print("\n [SHUTDOWN] Arrêt du Logger Asynchrone...")
+        # --- NETTOYAGE CENTRALISÉ ---
+        # Peu importe si on a 1 cerveau, 10 threads ou si ça a planté,
+        # la Config connait tout le monde et éteint la lumière.
+        GenesisConfig.global_shutdown()
