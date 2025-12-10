@@ -64,7 +64,7 @@ author's availability. There is no pressure or timeline for updates.
 ================================================================================
 """
 
-strVersion = "0.0.96_16_STABLE_alpha"
+strVersion = "0.0.96_16_10_STABLE_alpha"
 
 
 import torch
@@ -144,7 +144,7 @@ class GenesisConfig:
     # --- REGISTRE DES THREADS ACTIFS (Pattern Pool) ---
     RUNNING_THREADS = []
 
-    def __init__(self, dim=4096, shard_count=5, PrecisionType="FP32", ForceCPU = False,str_version=f'GENEISIS MVP{strVersion} (Performance & Hardening)'):
+    def __init__(self, dim=4096, shard_count=5, PrecisionType="FP32", ForceCPU = False,str_version=f'GENEISIS MVP{strVersion} (Performance & Hardening)', ENABLE_MULTITHREADING = True, FORCE_LIGHT_MODE = False):
         if ForceCPU:
             self.DEVICE = torch.device("cpu")
         else:
@@ -298,7 +298,7 @@ class GenesisConfig:
         self.QUANTIZATION_EPSILON = 1e-5
         
         # --- MVP97 : TURBO PIPELINE ---
-        self.ENABLE_MULTITHREADING = True  # Active le Bridge Léger
+        self.ENABLE_MULTITHREADING = ENABLE_MULTITHREADING  # Active le Bridge Léger
         self.INGESTION_QUEUE_SIZE = 50     # Backpressure (Max batchs en attente)
         self.INGESTION_TIMEOUT = 0.5       # Temps d'attente max des workers
         self.BRIDGE_SYNC_TIMEOUT = 20.0    # Timeout augmenté pour la stabilité
@@ -317,14 +317,46 @@ class GenesisConfig:
         # --- MVP98 : HEAVY BRIDGE CONFIG ---
         # Nombre de processus lourds (CPU bound)
         # On laisse 2 coeurs libres pour le système et le Main Thread/GPU driver
+        # --- MVP98 : HEAVY BRIDGE CONFIG ---
+        # [USER CONTROL] Mettre à True pour interdire le Multiprocessing (Debug ou petites configs)
+        self.FORCE_LIGHT_MODE = FORCE_LIGHT_MODE 
+        # --- CONFIGURATION DU COMPORTEMENT ---
+        # Si True : perceive() bloque jusqu'à ce que le traitement soit fini (Idéal pour Tests/Debug)
+        self.SYNCHRONOUS_PERCEPTION = True
+        # Détection et Application de la Stratégie
         try:
             cpu_count = multiprocessing.cpu_count()
-            self.HEAVY_WORKERS_COUNT = max(1, cpu_count - 2)
-        except NotImplementedError:
-            self.HEAVY_WORKERS_COUNT = 1
             
-        self.HEAVY_QUEUE_SIZE = 100 # Taille tampon entre Process et Main Thread
+            # La règle de décision explicite :
+            # 1. Si l'utilisateur force le mode Light -> LIGHT
+            # 2. Si on a moins de 4 coeurs -> LIGHT (Trop de surcharge pour rien)
+            # 3. Sinon -> HEAVY (Mode nominal MVP98)
+            
+            if self.FORCE_LIGHT_MODE:
+                print(" [CONFIG] Mode Light FORCÉ par l'utilisateur.")
+                self.ENABLE_HEAVY_BRIDGE = False
+                self.HEAVY_WORKERS_COUNT = 1
+            elif cpu_count < 4:
+                print(" [CONFIG] Mode Light FORCÉ par hardware")
+                print(f" [CONFIG] CPU insuffisant pour Heavy Bridge ({cpu_count} coeurs). Passage en Light.")
+                self.ENABLE_HEAVY_BRIDGE = False
+                self.HEAVY_WORKERS_COUNT = 1
+            else:
+                # Mode Heavy activé
+                self.ENABLE_HEAVY_BRIDGE = True
+                # On garde 2 coeurs pour le système/GPU, minimum 1 worker
+                self.HEAVY_WORKERS_COUNT = max(1, cpu_count - 2)
+                
+        except NotImplementedError:
+            # Fallback de sécurité (OS exotiques)
+            self.ENABLE_HEAVY_BRIDGE = False
+            self.HEAVY_WORKERS_COUNT = 1
+
+        self.HEAVY_QUEUE_SIZE = 100 
         
+        mode_str = "HEAVY (Multi-Process)" if self.ENABLE_HEAVY_BRIDGE else "LIGHT (Threaded)"
+        print(f" [CONFIG] Architecture Ingestion Active : {mode_str}")
+            
         
         
         
@@ -2087,95 +2119,229 @@ HARDWARE_REGISTRY = {
 
 class GenesisBridge(threading.Thread):
     """
-    [BRIDGE LEGER - PRODUCTION]
-    Classe Mère pour les workers asynchrones basés sur Threading (Zero-Copy).
-    Gère le cycle de vie, la sécurité et le flux de données.
+    Classe Mère pour les workers.
+    Accepte brain=None pour le mode Headless (utilisé dans les sous-processus).
     """
-    def __init__(self, name, brain, input_q=None, output_q=None):
+    def __init__(self, name, brain=None, input_q=None, output_q=None):
         super().__init__(name=name)
         self.brain = brain
         self.in_q = input_q if input_q else queue.Queue(maxsize=100)
         self.out_q = output_q if output_q else queue.Queue(maxsize=CFG.INGESTION_QUEUE_SIZE)
-        self.daemon = True # Meurt avec le programme principal
+        self.daemon = True 
         self.stop_event = threading.Event()
-        GenesisConfig.register(self) # Je m'enregistre dans le pool
+        
+        # Enregistrement seulement si on est dans le thread principal (avec un brain)
+        if self.brain:
+            GenesisConfig.register(self)
 
     def stop(self):
         self.stop_event.set()
 
     def process_data(self, raw_data):
-        """Méthode abstraite à surcharger par les implémentations."""
         raise NotImplementedError
 
     def run(self):
         print(f" [BRIDGE] Démarrage du worker léger : {self.name}")
         while not self.stop_event.is_set():
             try:
-                # 1. Attente non-bloquante (avec timeout pour vérifier le stop_event)
                 raw_data = self.in_q.get(timeout=CFG.INGESTION_TIMEOUT)
-                
-                # --- MODIFICATION : GESTION DU MARQUEUR ---
                 if raw_data == "__SYNC_MARKER__":
-                    # On renvoie le marqueur tel quel pour dire "J'ai fini tout ce qu'il y avait avant"
                     self.out_q.put({"type": "MARKER"})
                     continue
-                # ------------------------------------------
                 
-                # 2. Traitement (Tokenization/Encodage...)
-                # C'est ici que le GIL est relâché par les libs Rust/C++
                 result = self.process_data(raw_data)
-                
-                if result is not None:
-                    # 3. Envoi vers le GPU (Peut bloquer si le GPU est saturé -> Backpressure)
-                    self.out_q.put(result, timeout=5.0)
+                # Note: process_data peut gérer l'envoi lui-même
                     
             except queue.Empty:
-                continue
-            except queue.Full:
-                print(f" [WARN] Bridge {self.name} saturé (GPU trop lent).")
                 continue
             except Exception as e:
                 print(f" [ERR] Bridge {self.name} crash: {e}")
 
 class TextIngestionBridge(GenesisBridge):
     """
-    Ouvrier spécialisé dans la préparation du texte.
-    Transforme (Str) -> (Tenseurs Prêts)
+    [LOGIC CORE] Gère la préparation du texte.
+    Peut fonctionner en mode :
+    1. CONNECTÉ (Light Bridge) : Utilise self.brain pour vectoriser immédiatement.
+    2. DÉTACHÉ (Heavy Bridge) : Utilise un tokenizer local pour préparer les paquets.
     """
-    def process_data(self, text_batch):
-        # text_batch est une liste de lignes brutes
+    def __init__(self, name, brain=None):
+        super().__init__(name, brain)
+        self.local_tokenizer = None
         
-        for line in text_batch:
-            # 1. Logique de découpage LEGACY (Idem _process_sequential_legacy)
-            # On remplace "." par " ." puis on split sur " ."
-            # Cela a deux effets : séparer les phrases ET supprimer le point des tokens.
+    def setup_headless(self):
+        """Initialise les outils pour le mode détaché (sans brain)."""
+        try:
+            from tokenizers import Tokenizer, models, pre_tokenizers, decoders, normalizers
+            self.local_tokenizer = Tokenizer(models.BPE())
+            self.local_tokenizer.normalizer = normalizers.Sequence([
+                normalizers.NFD(), normalizers.Lowercase(), normalizers.StripAccents()
+            ])
+            self.local_tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+            self.local_tokenizer.decoder = decoders.ByteLevel()
+            self.local_tokenizer.model = models.BPE(vocab={chr(i): i for i in range(256)}, merges=[])
+        except ImportError:
+            self.local_tokenizer = None
+
+    def process_cpu_batch(self, raw_lines):
+        """
+        [FONCTION COEUR] Logique pure CPU partagée (Light & Heavy).
+        Nettoie, Découpe (Split) et Tronçonne (Chunking) le texte.
+        """
+        processed_items = []
+        # On récupère la limite de taille (Défaut 128 si pas de config)
+        max_len = CFG.MAX_SEQUENCE_LENGTH if hasattr(builtins, 'CFG') else 128
+        
+        for line in raw_lines:
+            # 1. Nettoyage et split phrases (Premier niveau)
             sentences = line.replace(".", " .").split(" .")
             
             for sent in sentences:
-                clean_sent = sent.strip()
-                if not clean_sent: continue
+                txt = sent.strip()
+                if not txt: continue
                 
-                words = clean_sent.split()
-                if not words: continue
+                # 2. Découpage en Mots (Niveau Sémantique)
+                all_words = txt.split()
+                if not all_words: continue
                 
-                # 2. Encodage d'UNE SEULE phrase
-                # On n'attend pas d'avoir 128 mots, on envoie la phrase telle quelle.
-                # C'est vital pour que la physique ne mélange pas "Le Chat..." et "Le Chien..."
-                vecs, weights = self.brain.encoder.encode_batch_fast(words)
+                # 3. CHUNKING (Sécurité Buffer)
+                # C'est ici qu'on applique l'optimisation de troncation centralisée
+                for i in range(0, len(all_words), max_len):
+                    chunk_words = all_words[i : i + max_len]
+                    
+                    # Tokenization ou Hash (Agnostique)
+                    token_ids = []
+                    tokenizer = self.local_tokenizer
+                    if not tokenizer and self.brain:
+                        tokenizer = self.brain.encoder.tokenizer
+                    
+                    if tokenizer:
+                        # On simule des IDs (le GPU refera le calcul fin si besoin)
+                        token_ids = [0] * len(chunk_words)
+                    else:
+                        token_ids = [abs(hash(w)) % 5000 for w in chunk_words]
+
+                    local_counts = Counter(chunk_words)
+                    
+                    # Structure standardisée
+                    item = {
+                        "ids": token_ids,
+                        "tokens": chunk_words, # Paquet sûr (<= 128 mots)
+                        "counts": local_counts,
+                        "raw_text": " ".join(chunk_words)
+                    }
+                    processed_items.append(item)
+                
+        return processed_items
+
+    def process_data(self, text_batch):
+        """Point d'entrée pour le Light Bridge (Thread)."""
+        # 1. Préparation CPU (Réutilisation de la logique coeur)
+        items = self.process_cpu_batch(text_batch)
+        
+        # 2. Finalisation GPU (Spécifique Light Bridge)
+        if self.brain:
+            for item in items:
+                # En mode Light, on vectorise tout de suite
+                vecs, weights = self.brain.encoder.encode_batch_fast(item["tokens"])
                 
                 packet = {
                     "type": "TEXT_BATCH",
                     "vecs": vecs,
                     "weights": weights,
-                    "tokens": words, # Ici, "words" ne contient plus de point "."
+                    "tokens": item["tokens"],
                     "count": len(vecs)
                 }
-                
-                # 3. Envoi au Stream
-                # Le Stream va traiter ce paquet, vider son buffer, et être prêt pour la suite.
                 self.out_q.put(packet)
-            
         return None
+        
+class TextIngestionHeavyBridge(GenesisBridge):
+    """
+    [HEAVY BRIDGE - ORCHESTRATEUR]
+    Gère les processus et transmet les paquets SÉQUENTIELLEMENT au GPU.
+    """
+    def __init__(self, name, brain):
+        super().__init__(name, brain)
+        ctx = multiprocessing.get_context('spawn')
+        self.heavy_in_q = ctx.Queue(maxsize=CFG.HEAVY_QUEUE_SIZE)
+        self.heavy_out_q = ctx.Queue(maxsize=CFG.HEAVY_QUEUE_SIZE)
+        
+        self.workers = []
+        self.pending_markers = 0
+        
+        print(f" [HEAVY-BRIDGE] Initialisation de {CFG.HEAVY_WORKERS_COUNT} processus lourds...")
+        for i in range(CFG.HEAVY_WORKERS_COUNT):
+            # On passe la config pour que le worker connaisse MAX_SEQUENCE_LENGTH
+            config_snapshot = {"MAX_SEQUENCE_LENGTH": CFG.MAX_SEQUENCE_LENGTH}
+            w = HeavyIngestionWorker(i, self.heavy_in_q, self.heavy_out_q, config_snapshot)
+            w.start()
+            self.workers.append(w)
+
+    def stop(self):
+        super().stop()
+        print(" [HEAVY-BRIDGE] Arrêt des sous-processus...")
+        for w in self.workers:
+            if w.is_alive():
+                w.terminate()
+
+    def run(self):
+        print(f" [HEAVY-BRIDGE] Orchestrateur Démarré. Mode: {CFG.HEAVY_WORKERS_COUNT} CPUs.")
+        
+        while not self.stop_event.is_set():
+            # A. DISTRIBUTION
+            try:
+                while not self.in_q.empty():
+                    raw_data = self.in_q.get_nowait()
+                    if raw_data == "__SYNC_MARKER__":
+                        self.pending_markers = len(self.workers)
+                        for _ in range(len(self.workers)):
+                            self.heavy_in_q.put("__SYNC_MARKER__")
+                    else:
+                        self.heavy_in_q.put(raw_data)
+            except queue.Empty:
+                pass
+
+            # B. AGREGATION (Séquentielle)
+            got_data = True
+            while got_data:
+                try:
+                    packet = self.heavy_out_q.get(timeout=0.005)
+                    
+                    if packet["type"] == "MARKER":
+                        self.pending_markers -= 1
+                        if self.pending_markers <= 0:
+                            self.out_q.put({"type": "MARKER"})
+                            self.pending_markers = 0
+                            
+                    elif packet["type"] == "BATCH_RESULT":
+                        data_list = packet["data"]
+                        
+                        # --- FIX CRITIQUE : TRAITEMENT SÉQUENTIEL (COMME LIGHT BRIDGE) ---
+                        # On ne fusionne PAS tout. On traite item par item (phrase par phrase).
+                        for item in data_list:
+                            tokens = item["tokens"]
+                            if not tokens: continue
+                            
+                            # 1. Update Stats
+                            if "counts" in item:
+                                self.brain.encoder.stats.usage.update(item["counts"])
+                            
+                            # 2. Encodage GPU (Un paquet par phrase/chunk)
+                            vecs, weights = self.brain.encoder.encode_batch_fast(tokens)
+                            
+                            final_packet = {
+                                "type": "TEXT_BATCH",
+                                "vecs": vecs,
+                                "weights": weights,
+                                "tokens": tokens,
+                                "count": len(vecs)
+                            }
+                            self.out_q.put(final_packet)
+                            
+                except queue.Empty:
+                    got_data = False
+                except Exception as e:
+                    print(f" [ERR HEAVY] {e}")
+                    got_data = False
 
 class PrototypeHeavyBridge(multiprocessing.Process):
     """
@@ -2214,6 +2380,65 @@ class PrototypeHeavyBridge(multiprocessing.Process):
         print(" [HEAVY-BRIDGE] Arrêt.")
 
 
+# --- MVP98 : HEAVY BRIDGE WORKER (MULTIPROCESSING) ---
+class HeavyIngestionWorker(multiprocessing.Process):
+    """
+    [HEAVY SHELL] Coquille vide qui exécute le Logic Core dans un processus isolé.
+    """
+    def __init__(self, worker_id, input_queue, output_queue, config_dict):
+        super().__init__(name=f"HeavyWorker_{worker_id}")
+        self.worker_id = worker_id
+        self.in_q = input_queue
+        self.out_q = output_queue
+        self.cfg_snapshot = config_dict 
+        self.running = multiprocessing.Event()
+        self.running.set()
+        self.tokenizer = None 
+
+    
+
+    def run(self):
+        # 1. Instanciation du Cœur Logique (Mode Détaché / Headless)
+        # On crée le bridge sans Brain (brain=None), juste pour sa méthode process_cpu_batch
+        core_processor = TextIngestionBridge(name=f"Core_{self.worker_id}", brain=None)
+        
+        # On charge les outils locaux (Tokenizer) si dispo
+        core_processor.setup_headless()
+        
+        # print(f" [WORKER-{self.worker_id}] Prêt (Mode Shell).")
+        
+        while self.running.is_set():
+            try:
+                # A. Réception
+                raw_batch = self.in_q.get(timeout=0.5)
+                
+                if raw_batch == "__SYNC_MARKER__":
+                    self.out_q.put({"type": "MARKER", "worker_id": self.worker_id})
+                    continue
+                
+                # B. Délégation (Le point clé !)
+                # Le Worker n'a plus aucune idée de comment on découpe une phrase.
+                # Il demande juste au "Logic Core" de le faire.
+                processed_items = core_processor.process_cpu_batch(raw_batch)
+                
+                # C. Envoi
+                if processed_items:
+                    # Conversion au format de transport (sérialisable)
+                    batch_data = []
+                    for item in processed_items:
+                        batch_data.append({
+                            "type": "PREPROCESSED",
+                            "ids": item["ids"],
+                            "tokens": item["tokens"],
+                            "counts": item["counts"],
+                            "raw_text": item["raw_text"]
+                        })
+                        
+                    self.out_q.put({"type": "BATCH_RESULT", "data": batch_data})
+                    
+            except Exception:
+                continue
+
 class SensoryStream:
     def __init__(self, brain):
         self.brain = brain
@@ -2230,12 +2455,25 @@ class SensoryStream:
         self.weights_buffer = torch.zeros(self.MAX_LEN, dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         self.layer_type = None
         
-        # --- MVP97 : INITIALISATION BRIDGE ---
+        # --- OPTIMISATION : PROCESSEUR SÉQUENTIEL UNIQUE ---
+        # On le crée une seule fois pour éviter d'enregistrer 50 threads "fantômes"
+        self.seq_processor = TextIngestionBridge(name="SeqProcessor", brain=self.brain)
+        
+        # --- MVP98 : INITIALISATION BRIDGE (POINT UNIQUE) ---
         self.bridge = None
         if CFG.ENABLE_MULTITHREADING:
-            self.bridge = TextIngestionBridge("TextWorker_1", brain)
+            # On applique la stratégie décidée dans la Config (Heavy ou Light)
+            if CFG.ENABLE_HEAVY_BRIDGE:
+                # Option A : Architecture Massive (Multi-Process)
+                self.bridge = TextIngestionHeavyBridge("HeavyIngestor", brain)
+            else:
+                # Option B : Architecture Légère (Thread Simple)
+                self.bridge = TextIngestionBridge("LightIngestor", brain)
+                
             self.bridge.start()
-            print(" [STREAM] Mode Turbo Activé (Threaded Pipeline).")
+            print(f" [STREAM] Mode Pipeline ({self.bridge.name}) Activé.")
+        else:
+            print(" [WARN] Multithreading désactivé. Le bridge ne démarrera pas.")
 
     def stop(self):
         if self.bridge: self.bridge.stop()
@@ -2251,32 +2489,32 @@ class SensoryStream:
         self.current_trust_level = trust
         self.layer_type = layer_type
 
-        # --- CAS 1 : THREADING ACTIF ---
+        # --- CAS 1 : THREADING ACTIF (Clean & Simple) ---
         if self.bridge and (mode == "TRAINING" or mode == "REALITY"):
+            
+            # 1. On envoie les données
             self.bridge.in_q.put(token_list_raw)
             
+            # 2. Si on doit attendre (Test/Training), on envoie le marqueur de fin
             if sync_wait:
-                # On envoie le marqueur
                 self.bridge.in_q.put("__SYNC_MARKER__")
                 
-                # On attend le retour
+                # 3. Boucle d'attente active (Token Passing)
+                # On consomme tout ce qui arrive jusqu'à retrouver notre marqueur
                 while True:
                     try:
-                        packet = self.bridge.out_q.get(timeout=10.0) # Timeout généreux
+                        packet = self.bridge.out_q.get(timeout=10.0)
+                        
                         if packet["type"] == "MARKER":
-                            break # C'est fini pour ce lot
+                            break # C'est fini, on rend la main
                             
-                        # --- SURCHARGE DYNAMIQUE DU PRINT ---
-                        # Pendant cette exécution, tout 'print' (même dans OpAttribution)
-                        # partira dans le thread Logger sans bloquer le calcul.
+                        # Traitement des données reçues (avec redirection logs)
                         with PrintRedirector(LOGGER):
                             self._consume_physics_packet(packet)
-                        # ------------------------------------
-                        #self._consume_physics_packet(packet)
+                            
                     except queue.Empty:
-                        print(" [WARN] Bridge Timeout.")
+                        print(" [WARN] Bridge Timeout (Pas de réponse du Worker).")
                         break
-            
         # --- CAS 2 : SÉQUENTIEL (Fallback) ---
         else:
             self._process_sequential_legacy(token_list_raw)
@@ -2317,7 +2555,8 @@ class SensoryStream:
         weights = packet["weights"]
         words = packet["tokens"]
         n = packet["count"]
-        
+        #print("oooooooooooooooooooooooooooooooooo")
+        #print(f"packet:{packet}")
         # --- FIX CRASH SIZE MISMATCH ---
         # Si le paquet reçu est plus grand que le buffer interne (MAX_LEN), on tronque.
         # Idéalement, le worker devrait découper en amont, mais ceci est la sécurité ultime.
@@ -2349,31 +2588,52 @@ class SensoryStream:
         self.active_count = 0
 
     def _process_sequential_legacy(self, token_list_raw):
-        # ... (C'est le code de l'ancienne fonction receive_sequence que vous déplacez ici) ...
-        # Copiez-collez ici tout le contenu de votre ancienne fonction receive_sequence
-        # Pour ne pas casser le mode interactif "Chat".
-        if isinstance(token_list_raw, list):
-            text_block = " ".join(token_list_raw) 
+        """
+        Mode Séquentiel (Fallback / Debug).
+        [ALIGNEMENT] Utilise le "Logic Core" (TextIngestionBridge) pour garantir
+        le même découpage et chunking que les modes Parallèles.
+        """
+        # 1. Conversion en liste de lignes (format attendu par process_cpu_batch)
+        if isinstance(token_list_raw, str):
+            raw_lines = [token_list_raw]
         else:
-            text_block = token_list_raw
+            raw_lines = token_list_raw
+            
+        # 2. Utilisation du Processeur Unique (Plus d'instanciation ici !)
+        # Le processeur est déjà prêt dans self.seq_processor
         
-        sentences = text_block.replace(".", " .").split(" .") 
-        for sent in sentences:
-            if not sent.strip(): continue
-            words = sent.strip().split() 
-            vecs, weights = self.brain.encoder.encode_batch_fast(words)
-            n_words = len(words)
-            if n_words > self.MAX_LEN:
-                 n_words = self.MAX_LEN; words = words[:n_words]; vecs = vecs[:n_words]; weights = weights[:n_words]
+        # 3. Traitement Standardisé (Nettoyage + Split + Chunking)
+        processed_items = self.seq_processor.process_cpu_batch(raw_lines)
+        
+        # 4. Exécution Séquentielle
+        for item in processed_items:
+            tokens = item["tokens"]
+            if not tokens: continue
+            
+            # Encodage GPU (Direct, on est sur le Main Thread)
+            vecs, weights = self.brain.encoder.encode_batch_fast(tokens)
+            
+            # Pas besoin de check de taille ici, process_cpu_batch a déjà fait le Chunking (128)
+            n_words = len(tokens)
+            
+            # Mise à jour Stats (pour parité avec les workers)
+            self.brain.encoder.stats.usage.update(item["counts"])
 
+            # Injection Buffer
             self.active_count = n_words
             self.vecs_buffer[:n_words] = vecs.to(dtype=CFG.COMPUTE_DTYPE)
             self.weights_buffer[:n_words] = weights.to(dtype=CFG.COMPUTE_DTYPE)
             self.positions_buffer[:n_words] = torch.arange(n_words, device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
-            for i, w in enumerate(words): self.word_tokens[i] = w # Fallback manuel
             
-            self.brain.memory.update_batch(words, vecs)
+            # Mise à jour Token Strings
+            for i, w in enumerate(tokens): 
+                self.word_tokens[i] = w 
+            
+            # Apprentissage & Physique
+            self.brain.memory.update_batch(tokens, vecs)
             self._process_buffer_vectorized()
+            
+            # Reset
             self.active_count = 0
 
     def _generate_attention_mask(self, n):
@@ -3672,6 +3932,82 @@ class GenesisDiagnostic:
         self.test_hybrid_bridge_chaining()
         print("\n=== Fin Diagnostic ===")
     
+    def forensic_audit_ghosts(self):
+        print("\n--- AUDIT FORENSIC : RECHERCHE DES NOEUDS FANTÔMES ---")
+        base_dir = self.brain.cfg.BASE_MEM_DIR
+        
+        # 1. Chargement de la Carte Structurelle (Ce que le cerveau croit avoir)
+        struct_path = os.path.join(base_dir, "genesis_structure.json")
+        if not os.path.exists(struct_path):
+            print(" [SKIP] Pas de structure.json trouvée.")
+            return
+
+        structure = SafeFileManager.load_json(struct_path)
+        # On extrait les noms des noeuds depuis les chemins (ex: "ROOT/MENTAL/Concept" -> "Concept")
+        struct_names = set()
+        if "nodes" in structure:
+            for path in structure["nodes"].keys():
+                name = path.split('/')[-1]
+                struct_names.add(name)
+        
+        print(f" > Noeuds dans la structure (JSON) : {len(struct_names)}")
+
+        # 2. Chargement de l'Inventaire Vectoriel (Ce qui a une mémoire physique)
+        # On regarde dans le fichier principal et les shards
+        memory_names = set()
+        
+        # Scan du fichier principal
+        world_path = os.path.join(base_dir, "genesis_world.safetensors")
+        if os.path.exists(world_path):
+            # On utilise load_file de safetensors pour juste lire les clés sans charger la RAM
+            from safetensors.torch import load_file
+            tensors = load_file(world_path)
+            for k in tensors.keys():
+                # Format souvent "Chemin:cle", on veut le nom du noeud s'il est indexé
+                # Mais ici on cherche surtout dans les Shards de mémoire
+                pass
+
+        # Scan des Shards de mémoire (C'est là que sont les vecteurs sémantiques)
+        for i in range(self.brain.cfg.SHARD_COUNT):
+            shard_path = os.path.join(base_dir, f"shard_{i}.safetensors")
+            if os.path.exists(shard_path):
+                from safetensors.torch import load_file
+                shard_data = load_file(shard_path)
+                for k in shard_data.keys():
+                    memory_names.add(k)
+        
+        print(f" > Vecteurs en banque (Safetensors) : {len(memory_names)}")
+
+        # 3. Comparaison (Le Delta)
+        # Les fantômes sont ceux qui sont dans la Structure MAIS PAS dans la Mémoire
+        ghosts = struct_names - memory_names
+        
+        print(f" > Nombre de Fantômes détectés : {len(ghosts)}")
+        
+        if ghosts:
+            print("\n [ANALYSE] Liste des disparus (Top 20) :")
+            sorted_ghosts = sorted(list(ghosts))
+            for g in sorted_ghosts[:20]:
+                print(f"   - {g}")
+                
+            if len(ghosts) > 20:
+                print(f"   ... et {len(ghosts) - 20} autres.")
+                
+            # Verdict
+            nb_concepts = sum(1 for g in ghosts if not g.startswith(("HYP_", "MOL_", "EVT_")))
+            print(f"\n [VERDICT] Parmi les fantômes :")
+            print(f"   - Hypothèses/Molécules/Events (Transient) : {len(ghosts) - nb_concepts}")
+            print(f"   - Concepts Purs (Potentiellement critique) : {nb_concepts}")
+            
+            if nb_concepts == 0:
+                print(" [SUCCESS] Perte bénigne. Seuls des éléments transitoires ont été nettoyés.")
+            else:
+                print(" [WARN] Attention, des concepts nommés ont perdu leur vecteur (Reset usine).")
+        else:
+            print(" [SUCCESS] Intégrité parfaite. Aucun fantôme.")
+    
+    
+    
     def test_precision_mode(self):
         print(f"\n--- TEST N11: PRECISION MODE ({CFG.PRECISION_MODE}) ---")
         # CORRECTION AUDIT : Utilisation de vecteurs normalisés pour simuler la réalité
@@ -4659,6 +4995,8 @@ if __name__ == "__main__":
     #boolForceCPU = True
     str_lang = "fr" 
     boolResetBase = False
+    boolENABLE_MULTITHREADING = True #active le threading
+    boolFORCE_LIGHT_MODE = True #desactive le Multiprocess
     #boolResetBase = True # to reset database at start
     RUN_MODE = "DIAGNOSTIC" 
     #RUN_MODE = "LIFE_LOOP" 
@@ -4666,7 +5004,7 @@ if __name__ == "__main__":
     #RUN_MODE = "IMPORT_MODEL" 
     #RUN_MODE = "INFERENCE" 
     
-    CFG = GenesisConfig(dim=Nb_DIM, PrecisionType = strPRECISION_MODE, ForceCPU=boolForceCPU)
+    CFG = GenesisConfig(dim=Nb_DIM, PrecisionType = strPRECISION_MODE, ForceCPU=boolForceCPU, ENABLE_MULTITHREADING=boolENABLE_MULTITHREADING,FORCE_LIGHT_MODE=boolFORCE_LIGHT_MODE)
     # --- INSTANCE GLOBALE LOGGER ---
     LOGGER = GenesisAsyncLogger()
     LOGGER.start()
@@ -4679,6 +5017,7 @@ if __name__ == "__main__":
         bootloader = GenesisBootloader(CFG, brain)
         diagnostics = GenesisDiagnostic(brain)
         if RUN_MODE == "DIAGNOSTIC":
+            diagnostics.forensic_audit_ghosts()
             diagnostics.run_all()
         elif RUN_MODE == "LIFE_LOOP":
             brain.life_cycle()
