@@ -64,7 +64,7 @@ author's availability. There is no pressure or timeline for updates.
 ================================================================================
 """
 
-strVersion = "0.0.96_16_10_STABLE_alpha"
+strVersion = "0.0.96_16_13_STABLE_alpha"
 
 
 import torch
@@ -85,6 +85,17 @@ from collections import Counter
 from safetensors.torch import save_file, load_file
 import builtins
 import traceback
+
+# --- IMPORT LANCE DB ---
+try:
+    import lancedb
+    import pyarrow as pa
+    import pandas as pd
+    LANCEDB_AVAILABLE = True
+    print(" [SYSTEME] LanceDB détecté (Stockage Vectoriel).")
+except ImportError:
+    LANCEDB_AVAILABLE = False
+    print(" [SYSTEME] WARN: LanceDB manquant. Installez avec 'pip install lancedb'.")
 
 # --- 0. SYSTEME IO SECURISE (Global Lock) ---
 #CONSOLE_LOCK = threading.Lock()
@@ -151,6 +162,7 @@ class GenesisConfig:
             self.DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.STR_VERSION = str_version
         self.BASE_MEM_DIR = f'./memoire_GeneISys_vn{strVersion}'
+        
         
         if dim % 2 != 0: dim += 1
         self.DIM_SIZE = dim
@@ -382,6 +394,11 @@ class GenesisConfig:
         self.BATCH_UPDATE_CHUNK_SIZE = max(1024, self.DIM_SIZE // 2)
         
         
+    def iniPath(self):
+        # AJOUT : Chemin de la base LanceDB (Dossier interne)
+        self.LANCEDB_URI = os.path.join(self.BASE_MEM_DIR, "genesis_lancedb")
+        
+        
     @classmethod
     def register(cls, thread_instance):
         """Enregistre un thread pour qu'il soit nettoyé à la fin."""
@@ -407,6 +424,17 @@ class GenesisConfig:
             except Exception as e:
                 print(f" [WARN] Erreur lors de l'arrêt du thread {t.name}: {e}")
         cls.RUNNING_THREADS.clear()
+        
+        
+        # 2. Fermeture de la Base de Données (Ajout)
+        # On doit importer la classe ici pour éviter les imports circulaires si nécessaire,
+        # ou simplement appeler la méthode si HybridMemoryCluster est dispo dans le scope.
+        # Comme tout est dans le même fichier, on peut l'appeler directement.
+        try:
+            if 'HybridMemoryCluster' in globals():
+                HybridMemoryCluster.close_shared_db()
+        except Exception as e:
+            print(f" [WARN] Erreur fermeture DB: {e}")
 
 #first call for function declaration when CFG.X is a default value
 CFG = GenesisConfig()
@@ -965,7 +993,79 @@ class AssociativeMemory:
              best_idx = best_indices[1].item()
         return self.vocab_words[best_idx]
 
+
+# --- NOUVEAU MOTEUR D'INDEXATION (ÉTAPE 3) ---
+class FaissMemoryEngine:
+    """
+    Wrapper pour l'indexation spatiale haute performance (Meta FAISS).
+    Remplace la recherche brute O(N^2) par une recherche approximative O(log N).
+    """
+    def __init__(self, dim, device="cpu"):
+        self.dim = dim
+        self.device = device
+        self.index = None
+        self.use_faiss = False
+        
+        try:
+            import faiss
+            self.use_faiss = True
+            # IndexFlatIP = Inner Product (Produit Scalaire).
+            # Comme nos vecteurs sont normalisés (F.normalize), IP == Cosine Similarity.
+            # C'est l'index le plus exact (Brute-force optimisé C++).
+            self.index = faiss.IndexFlatIP(dim)
+            
+            # Si on a un GPU et faiss-gpu, on pourrait transférer l'index ici
+            # Pour l'instant, on reste sur CPU (RAM système) pour préparer l'étape 4 (Mémoire Infinie)
+            print(f" [SYSTEME] FAISS Engine Activé (Dimension: {dim}).")
+        except ImportError:
+            print(" [WARN] FAISS non trouvé. Mode dégradé (Torch Brute-Force).")
+            self.use_faiss = False
+
+    def add_vectors(self, vectors_tensor):
+        """Ajoute des vecteurs à l'index."""
+        if not self.use_faiss: return
+        
+        # FAISS attend du float32 sur CPU (Numpy)
+        if torch.is_tensor(vectors_tensor):
+            vectors_np = vectors_tensor.detach().cpu().float().numpy()
+        else:
+            vectors_np = vectors_tensor
+            
+        self.index.add(vectors_np)
+
+    def search(self, query_tensor, k=50):
+        """
+        Recherche les K plus proches voisins.
+        Retourne (scores, indices).
+        """
+        if not self.use_faiss: return None, None
+        
+        # Préparation requête
+        if query_tensor.dim() == 1:
+            query_tensor = query_tensor.unsqueeze(0)
+            
+        if torch.is_tensor(query_tensor):
+            query_np = query_tensor.detach().cpu().float().numpy()
+        else:
+            query_np = query_tensor
+            
+        # Recherche Rapide (C++)
+        D, I = self.index.search(query_np, k)
+        
+        # Conversion retour en Tensor pour rester compatible PyTorch
+        # On renvoie sur le device configuré (souvent GPU pour la suite du calcul)
+        return torch.from_numpy(D).to(CFG.DEVICE), torch.from_numpy(I).to(CFG.DEVICE)
+        
+    def reset(self):
+        if self.use_faiss:
+            self.index.reset()
+
+
 class HybridMemoryCluster:
+    # --- SINGLETON DE CONNEXION (Partagé par toutes les instances) ---
+    # Permet de survivre au 'del self.brain' et au 'optimize_memory_layout'
+    _shared_db = None
+
     def __init__(self, dim, max_nodes=None):
         self.dim = dim
         self.capacity = max_nodes if max_nodes else CFG.INITIAL_MAX_NODES
@@ -983,6 +1083,9 @@ class HybridMemoryCluster:
         # On en a besoin même en FP16/32 pour charger proprement les transitions de format
         self.master_scales = torch.ones((self.capacity, 1), dtype=torch.float32, device=CFG.STORAGE_DEVICE)
         
+        # AJOUT ÉTAPE 3 : Intégration du Moteur FAISS
+        self.search_engine = FaissMemoryEngine(dim)
+        
         if CFG.ENABLE_PAGING and self.master_storage.device.type == 'cpu':
             self.master_storage = self.master_storage.pin_memory()
             self.master_scales = self.master_scales.pin_memory()
@@ -991,8 +1094,46 @@ class HybridMemoryCluster:
         self.active_count = 0
         self.name_to_idx = {} 
         self.idx_to_name = {} 
-        self.shards = {i: {} for i in range(CFG.SHARD_COUNT)}
         
+        # --- REMPLACEMENT SHARDS PAR LANCEDB ---
+        #self.shards = {i: {} for i in range(CFG.SHARD_COUNT)}
+        # --- LANCEDB SINGLETON ACCESS ---
+        self.table = None
+        self._init_shared_db() # On initialise ou on récupère l'existant
+    
+    
+    @classmethod
+    def close_shared_db(cls):
+        """Ferme proprement la connexion partagée (Relâche les verrous)."""
+        if cls._shared_db is not None:
+            # On supprime la référence, le Garbage Collector de Python
+            # fermera les handles de fichiers sous-jacents.
+            print(" [MEMORY] Fermeture de la connexion LanceDB partagée.")
+            cls._shared_db = None
+    
+    
+    
+    def _init_shared_db(self):
+        """Initialise la connexion unique si elle n'existe pas encore."""
+        if not LANCEDB_AVAILABLE: return
+
+        # Si la connexion existe déjà au niveau de la classe, on ne fait rien
+        if HybridMemoryCluster._shared_db is not None:
+            return
+
+        try:
+            os.makedirs(CFG.LANCEDB_URI, exist_ok=True)
+            # On stocke la connexion dans la variable de CLASSE
+            HybridMemoryCluster._shared_db = lancedb.connect(CFG.LANCEDB_URI)
+            print(f" [MEMORY] Connexion LanceDB (Singleton) établie : {CFG.LANCEDB_URI}")
+        except Exception as e:
+            print(f" [ERR] Echec connexion LanceDB: {e}")
+    
+    @property
+    def db(self):
+        """Accesseur pour récupérer le singleton."""
+        return HybridMemoryCluster._shared_db
+    
     def resize(self, new_capacity):
         print(f" [MEMORY] Tentative de redimensionnement : {self.capacity} -> {new_capacity}")
         if new_capacity <= self.capacity: return
@@ -1057,18 +1198,18 @@ class HybridMemoryCluster:
             indices_list.append(idx)
             
             # Mise à jour Shard
-            sid = abs(hash(name)) % CFG.SHARD_COUNT
+            #sid = abs(hash(name)) % CFG.SHARD_COUNT
             
-            if self.is_quantized:
-                # En mode INT8, le shard doit stocker le tuple (vec, scale) ou un objet composite
-                # Pour simplifier la compatibilité fichier, on stocke le vecteur compressé
-                # ATTENTION : La gestion des shards en INT8 demandera une maj de save/load_shard plus tard
-                # Pour l'instant, on stocke le tenseur principal.
-                self.shards[sid][name] = storage_vectors[i].detach().to(CFG.DEVICE)
-                # Note: On perd l'échelle dans les Shards ici pour l'instant (dette technique acceptée pour cette étape)
-                # Mais on l'a dans master_scales pour le runtime.
-            else:
-                self.shards[sid][name] = storage_vectors[i].detach().to(CFG.DEVICE)
+            #if self.is_quantized:
+            #    # En mode INT8, le shard doit stocker le tuple (vec, scale) ou un objet composite
+            #    # Pour simplifier la compatibilité fichier, on stocke le vecteur compressé
+            #    # ATTENTION : La gestion des shards en INT8 demandera une maj de save/load_shard plus tard
+            #    # Pour l'instant, on stocke le tenseur principal.
+            #    self.shards[sid][name] = storage_vectors[i].detach().to(CFG.DEVICE)
+            #    # Note: On perd l'échelle dans les Shards ici pour l'instant (dette technique acceptée pour cette étape)
+            #    # Mais on l'a dans master_scales pour le runtime.
+            #else:
+            #    self.shards[sid][name] = storage_vectors[i].detach().to(CFG.DEVICE)
             
         if not indices_list: return
         
@@ -1105,6 +1246,13 @@ class HybridMemoryCluster:
         self.master_storage.index_copy_(0, indices_cpu, storage_tensor)
         if self.is_quantized:
             self.master_scales.index_copy_(0, indices_cpu, scales_tensor)
+            
+        # Mise à jour de l'index FAISS
+        # Note: Dans cette version MVP, on ajoute simplement. 
+        # Pour l'étape 4 (Disque), on gèrera les IDs explicitement.
+        if self.search_engine.use_faiss:
+            # On envoie les vecteurs décompressés/frais à FAISS
+            self.search_engine.add_vectors(vectors)
 
     def update(self, name, vector):
         if vector.dim() == 1: vector = vector.unsqueeze(0)
@@ -1117,6 +1265,29 @@ class HybridMemoryCluster:
 
     def find_top_k(self, query_vec, k=50, threshold=0.0):
         if self.active_count == 0: return []
+        
+        # SCÉNARIO A : FAISS (Ultra Rapide)
+        if self.search_engine.use_faiss:
+            scores, indices = self.search_engine.search(query_vec, k)
+            
+            results = []
+            # indices est [1, K], scores est [1, K]
+            found_indices = indices[0]
+            found_scores = scores[0]
+            
+            for i in range(len(found_indices)):
+                idx = found_indices[i].item()
+                score = found_scores[i].item()
+                
+                if idx != -1 and score > threshold: # -1 veut dire "pas de voisin"
+                    # FAISS renvoie des index relatifs à son ajout.
+                    # Comme on ajoute dans l'ordre, FAISS ID == Memory ID.
+                    if idx < self.active_count:
+                        name = self.idx_to_name.get(idx)
+                        if name: results.append((name, score))
+            return results
+
+        # SCÉNARIO B : FALLBACK (Code Existant - Lent)
         if query_vec.dim() == 1: query_vec = query_vec.unsqueeze(0)
         q = query_vec.to(dtype=CFG.INDEX_DTYPE, device=CFG.INDEX_DEVICE)
         
@@ -1205,42 +1376,107 @@ class HybridMemoryCluster:
             self.master_storage[:self.active_count] = cpu_data
         # -----------------------------------------------
         
-        # Synchro Shards (pour sauvegarde)
-        for name, idx in self.name_to_idx.items():
-            if idx < self.active_count:
-                vec = self.master_storage[idx]
-                sid = abs(hash(name)) % CFG.SHARD_COUNT
-                if self.master_storage.device.type == 'cpu':
-                    safe_vec = vec.detach().clone()
-                else:
-                    safe_vec = vec.detach()
-                self.shards[sid][name] = safe_vec
-                
-                if encoder_ref is not None and not self.is_quantized:
-                     if self.master_storage.device.type == 'cpu':
-                         encoder_ref.semantic_map[name] = safe_vec.clone()
-                     else:
-                         encoder_ref.semantic_map[name] = safe_vec
+        # --- PARTIE A SUPPRIMER/MODIFIER ---
+        # Ancienne boucle "Synchro Shards" -> ON SUPPRIME ou ON SIMPLIFIE
+        # On garde juste la mise à jour de l'encoder_ref si nécessaire pour le runtime
+        if encoder_ref is not None:
+            for name, idx in self.name_to_idx.items():
+                if idx < self.active_count:
+                    # On met à jour la map sémantique de l'encodeur pour éviter les incohérences
+                    # Mais on ne touche plus à self.shards
+                    vec = self.master_storage[idx]
+                    if self.master_storage.device.type == 'cpu':
+                        safe_vec = vec.detach().clone()
+                    else:
+                        safe_vec = vec.detach()
+                        
+                    if not self.is_quantized:
+                         if self.master_storage.device.type == 'cpu':
+                             encoder_ref.semantic_map[name] = safe_vec.clone()
+                         else:
+                             encoder_ref.semantic_map[name] = safe_vec
         
+    def _ensure_connection(self):
+        """Tente de rétablir la connexion LanceDB si elle est perdue."""
+        if self.db is not None: return True
+        if not LANCEDB_AVAILABLE: return False
+        
+        # print(" [MEMORY] Tentative de connexion LanceDB à la volée...")
+        try:
+            self._init_shared_db()
+            return True
+        except Exception as e:
+            print(f" [ERR] Echec connexion LanceDB: {e}")
+            return False
         
     def save_all(self, encoder_ref=None):
         self.sync_to_host(encoder_ref)
         
-        for sid, data in self.shards.items():
-            SafeFileManager.save_shard(data, sid, CFG.BASE_MEM_DIR)
+        # --- FIX ROBUSTESSE ---
+        # On tente de se connecter même si ça a échoué au boot
+        if not self._ensure_connection():
+            print(" [WARN] LanceDB non dispo (Echec connexion). Sauvegarde annulée.")
+            return
+        # ----------------------
         
-        # Sauvegarde des Scales si on est en INT8
-        if self.is_quantized and self.master_scales is not None:
-             # On sauvegarde juste la partie active
-             active_scales = self.master_scales[:self.active_count]
-             SafeFileManager.save_tensors({"memory_scales": active_scales}, os.path.join(CFG.BASE_MEM_DIR, "memory_scales.safetensors"))
+        
+        
+        if not LANCEDB_AVAILABLE or (self.db is None):
+            print(" [WARN] LanceDB non dispo. Sauvegarde annulée (Mode Shard désactivé).")
+            print(LANCEDB_AVAILABLE)
+            print(self.db)
+            return
 
-        SafeFileManager.save_json({
-            "mapping": {
-                "name_to_idx": self.name_to_idx, 
-                "active_count": self.active_count
-            }
-        }, os.path.join(CFG.BASE_MEM_DIR, "memory_index.json"))
+        print(f" [MEMORY] Sauvegarde vers LanceDB ({self.active_count} entrées)...")
+        
+        try:
+            # A. Extraction des données actives pour le disque
+            # On veut sauvegarder des vecteurs propres (FP32) pour la recherche future
+            # LanceDB gèrera sa propre compression si besoin.
+            
+            # Récupération depuis le Fast Index (toujours décompressé et à jour)
+            # On passe par le CPU pour Pandas
+            if self.fast_index.is_cuda:
+                vecs_np = self.fast_index[:self.active_count].cpu().float().numpy()
+            else:
+                vecs_np = self.fast_index[:self.active_count].float().numpy()
+                
+            names_list = [self.idx_to_name[i] for i in range(self.active_count)]
+            
+            # B. Création du DataFrame
+            # LanceDB aime les listes de vecteurs
+            vecs_list = list(vecs_np) 
+            
+            df = pd.DataFrame({
+                "name": names_list,
+                "vector": vecs_list,
+                "id": list(range(self.active_count)) # On stocke l'ID mémoire pour référence
+            })
+            
+            # C. Écriture atomique (Overwrite pour le snapshot complet)
+            # Pour l'instant, on écrase la table 'concepts' à chaque sauvegarde (comme les shards)
+            # C'est simple et robuste.
+            self.table = self.db.create_table("concepts", data=df, mode="overwrite")
+            
+            # Sauvegarde des métadonnées (inchangé)
+            SafeFileManager.save_json({
+                "mapping": {
+                    "name_to_idx": self.name_to_idx, 
+                    "active_count": self.active_count
+                }
+            }, os.path.join(CFG.BASE_MEM_DIR, "memory_index.json"))
+            
+            # Sauvegarde des Scales si INT8 (Optionnel si on reload depuis LanceDB en FP32)
+            # Mais on le garde pour la cohérence RAM
+            if self.is_quantized:
+                 active_scales = self.master_scales[:self.active_count]
+                 SafeFileManager.save_tensors({"memory_scales": active_scales}, os.path.join(CFG.BASE_MEM_DIR, "memory_scales.safetensors"))
+                 
+            print(" [SUCCESS] Sauvegarde LanceDB terminée.")
+            
+        except Exception as e:
+            print(f" [CRITICAL] Echec sauvegarde LanceDB: {e}")
+            traceback.print_exc()
         
         
     def load_index(self):
@@ -1259,53 +1495,71 @@ class HybridMemoryCluster:
                  len_s = min(loaded_scales.shape[0], self.capacity)
                  self.master_scales[:len_s] = loaded_scales[:len_s]
                  print(f" [MEMORY] Scales chargés ({len_s} entrées).")
+                 
+                 
+                 
+        # --- FIX ROBUSTESSE ---
+        # On vérifie la connexion avant de charger
+        has_db = self._ensure_connection()
 
-        # Chargement Données
-        for sid in range(CFG.SHARD_COUNT):
-            data = SafeFileManager.load_shard(sid, CFG.BASE_MEM_DIR)
-            for k, v in data.items():
-                self.shards[sid][k] = v
-                
-                if k in self.name_to_idx:
-                    idx = self.name_to_idx[k]
-                    if idx < self.capacity:
+        # --- CHARGEMENT DEPUIS LANCEDB ---
+        if LANCEDB_AVAILABLE and (self.db is not None)and has_db:
+            try:
+                # Vérifie si la table existe
+                if "concepts" in self.db.table_names():
+                    self.table = self.db.open_table("concepts")
+                    print(f" [MEMORY] Chargement depuis LanceDB ({self.table.count_rows()} lignes)...")
+                    
+                    # On charge tout en RAM (Pour l'instant - Étape "Hot Memory")
+                    # LanceDB -> Pandas -> Torch
+                    df = self.table.to_pandas()
+                    
+                    # On s'assure de l'ordre via les IDs
+                    df = df.sort_values("id")
+                    
+                    # Reconstruction des vecteurs
+                    # stack convertit la colonne de listes en matrice numpy
+                    vecs_np = np.stack(df["vector"].values)
+                    vecs_tensor = torch.from_numpy(vecs_np).to(dtype=CFG.COMPUTE_DTYPE) # FP32
+                    
+                    count = len(vecs_tensor)
+                    if count > self.capacity:
+                        self.resize(count + 1000)
+                    
+                    # Injection dans Master Storage & Fast Index
+                    # Note : Si on est en INT8, on recompressera à la volée ou on utilisera les scales chargés
+                    
+                    if self.is_quantized:
+                        # On re-quantize depuis les vecteurs propres de la DB pour être sûr
+                        q_vecs, q_scales = SmartQuantizer.quantize(vecs_tensor)
+                        self.master_storage[:count] = q_vecs.to(CFG.STORAGE_DEVICE)
+                        # On préfére les scales calculés ici ou ceux du fichier ?
+                        # Ceux du fichier sont plus stables si on n'a pas tout rechargé. 
+                        # Mais ici on recharge tout. On peut updater.
+                        self.master_scales[:count] = q_scales.to(CFG.STORAGE_DEVICE)
+                    else:
+                        self.master_storage[:count] = vecs_tensor.to(CFG.STORAGE_DEVICE)
                         
-                        # --- LOGIQUE UNIVERSELLE DE CHARGEMENT ---
-                        # Source (Fichier) vs Destination (Mode Configuré)
+                    # Fast Index (Toujours FP32/16)
+                    self.fast_index[:count] = vecs_tensor.to(CFG.INDEX_DEVICE, dtype=CFG.INDEX_DTYPE)
+                    
+                    # Reconstruction FAISS
+                    if self.search_engine.use_faiss:
+                        self.search_engine.reset()
+                        self.search_engine.add_vectors(vecs_tensor)
                         
-                        # Cas 1 : Source INT8 -> Mode Float (Décompression)
-                        if v.dtype == torch.int8 and not self.is_quantized:
-                             scale = self.master_scales[idx].to(CFG.STORAGE_DEVICE)
-                             v_in = v.to(CFG.STORAGE_DEVICE)
-                             v_final = SmartQuantizer.dequantize(v_in, scale).to(CFG.STORAGE_DTYPE)
-                             
-                        # Cas 2 : Source Float -> Mode INT8 (Compression)
-                        # C'est le cas qui manquait ("l'oubli du if")
-                        elif v.dtype != torch.int8 and self.is_quantized:
-                             v_in = v.to(CFG.STORAGE_DEVICE)
-                             # On doit quantizer à la volée
-                             q_vec, q_scale = SmartQuantizer.quantize(v_in)
-                             v_final = q_vec
-                             self.master_scales[idx] = q_scale.squeeze() # Update du scale manquant
-                             
-                        # Cas 3 : Identiques (INT8->INT8 ou Float->Float)
-                        else:
-                             v_final = v.to(dtype=CFG.STORAGE_DTYPE, device=CFG.STORAGE_DEVICE)
-                        
-                        # Stockage Maître
-                        self.master_storage[idx] = v_final
-                        
-                        # Restauration Fast Index (Toujours Float sur GPU)
-                        if v_final.dtype == torch.int8:
-                             scale = self.master_scales[idx].to(CFG.INDEX_DEVICE)
-                             v_gpu = v_final.to(CFG.INDEX_DEVICE)
-                             v_idx = SmartQuantizer.dequantize(v_gpu, scale)
-                        else:
-                             v_idx = v_final.to(CFG.INDEX_DEVICE)
-                             
-                        self.fast_index[idx] = v_idx.to(dtype=CFG.INDEX_DTYPE).reshape(self.dim)
+                    print(f" [SUCCESS] Index restauré depuis LanceDB.")
+                else:
+                    print(" [MEMORY] Aucune table LanceDB trouvée (Premier lancement ou Reset).")
+                    
+            except Exception as e:
+                print(f" [ERR] Echec chargement LanceDB: {e}")
+                traceback.print_exc()
+        
         
         print(f" [MEMORY] Index chargé et restauré ({self.active_count} noeuds).")
+        
+        
 
 class CognitiveStats:
     def __init__(self): self.usage = Counter(); self.accumulated_impact = {}; self.weights = {} 
@@ -3930,6 +4184,8 @@ class GenesisDiagnostic:
         self.test_hypothesis_acceptance()
         self.test_bridge_architecture()
         self.test_hybrid_bridge_chaining()
+        self.test_faiss_integration()
+        self.test_lancedb_persistence()
         print("\n=== Fin Diagnostic ===")
     
     def forensic_audit_ghosts(self):
@@ -3957,26 +4213,23 @@ class GenesisDiagnostic:
         memory_names = set()
         
         # Scan du fichier principal
-        world_path = os.path.join(base_dir, "genesis_world.safetensors")
-        if os.path.exists(world_path):
-            # On utilise load_file de safetensors pour juste lire les clés sans charger la RAM
-            from safetensors.torch import load_file
-            tensors = load_file(world_path)
-            for k in tensors.keys():
-                # Format souvent "Chemin:cle", on veut le nom du noeud s'il est indexé
-                # Mais ici on cherche surtout dans les Shards de mémoire
-                pass
+        # [MODIFICATION] Lecture depuis LanceDB au lieu des Shards Safetensors
+        if hasattr(self.brain.memory, 'db') and self.brain.memory.db is not None:
+            try:
+                if "concepts" in self.brain.memory.db.table_names():
+                    tbl = self.brain.memory.db.open_table("concepts")
+                    # On récupère juste la colonne des noms pour aller vite
+                    # to_arrow() est plus léger que to_pandas() pour une seule colonne
+                    df_names = tbl.search().limit(1000000).to_pandas()["name"] # Limit large
+                    memory_names = set(df_names.tolist())
+                    print(f" > Vecteurs dans LanceDB : {len(memory_names)}")
+                else:
+                    print(" [WARN] Table 'concepts' introuvable dans LanceDB.")
+            except Exception as e:
+                print(f" [ERR] Echec lecture LanceDB pour audit: {e}")
+        else:
+            print(" [WARN] LanceDB non connecté. Audit vectoriel impossible.")
 
-        # Scan des Shards de mémoire (C'est là que sont les vecteurs sémantiques)
-        for i in range(self.brain.cfg.SHARD_COUNT):
-            shard_path = os.path.join(base_dir, f"shard_{i}.safetensors")
-            if os.path.exists(shard_path):
-                from safetensors.torch import load_file
-                shard_data = load_file(shard_path)
-                for k in shard_data.keys():
-                    memory_names.add(k)
-        
-        print(f" > Vecteurs en banque (Safetensors) : {len(memory_names)}")
 
         # 3. Comparaison (Le Delta)
         # Les fantômes sont ceux qui sont dans la Structure MAIS PAS dans la Mémoire
@@ -4909,7 +5162,7 @@ class GenesisDiagnostic:
             
             
     def test_bridge_architecture(self):
-        print("\n--- 36. TEST ARCHITECTURE BRIDGE (MVP97) ---")
+        print("\n--- 40. TEST ARCHITECTURE BRIDGE (MVP97) ---")
         
         # Test 1 : Bridge Léger (Production)
         print(" > Test du Bridge Léger (Threading)...")
@@ -4929,7 +5182,7 @@ class GenesisDiagnostic:
             print(" [INFO] Multithreading désactivé dans la config.")
 
     def test_hybrid_bridge_chaining(self):
-        print("\n--- 37. TEST HYBRIDE (HEAVY -> LIGHT CHAIN) ---")
+        print("\n--- 41. TEST HYBRIDE (HEAVY -> LIGHT CHAIN) ---")
         print(" > Simulation d'un pipeline distribué...")
         
         # Files d'attente pour le processus lourd (Picklable)
@@ -4985,6 +5238,128 @@ class GenesisDiagnostic:
             heavy_bridge.join(timeout=1.0)
             if heavy_bridge.is_alive(): heavy_bridge.terminate()
 
+    def test_faiss_integration(self):
+        print("\n--- 42. TEST FAISS ENGINE (Integration & Benchmark) ---")
+        
+        # 1. Vérification de l'activation
+        engine = self.brain.memory.search_engine
+        if not engine.use_faiss:
+            print(" [INFO] FAISS non actif (Mode dégradé PyTorch). Test annulé.")
+            return
+
+        print(f" [INFO] FAISS est ACTIF. Index: {type(engine.index)}")
+
+        # 2. Setup Benchmark
+        N = 10000
+        dim = CFG.DIM_SIZE
+        print(f" > Génération de {N} vecteurs aléatoires (Dim={dim})...")
+        
+        # On crée des données sur CPU pour le test
+        db_vecs = torch.randn(N, dim, dtype=torch.float32)
+        db_vecs = F.normalize(db_vecs, p=2, dim=1) # Normalisation Cosine
+        
+        query = torch.randn(1, dim, dtype=torch.float32)
+        query = F.normalize(query, p=2, dim=1)
+        
+        # 3. Comparaison de Vitesse
+        # A. Approche PyTorch Brute (O(N))
+        t0 = time.perf_counter()
+        scores_torch = torch.mm(query, db_vecs.t())
+        best_score_torch, best_idx_torch = torch.topk(scores_torch, k=1)
+        t1 = time.perf_counter()
+        dur_torch = (t1 - t0) * 1000
+        
+        # B. Approche FAISS (Index)
+        test_engine = FaissMemoryEngine(dim)
+        t2 = time.perf_counter()
+        
+        # --- CORRECTION ICI : Utilisation du nom existant ---
+        test_engine.add_vectors(db_vecs) 
+        # ---------------------------------------------------
+        
+        t3 = time.perf_counter()
+        
+        scores_faiss, indices_faiss = test_engine.search(query, k=1) 
+        t4 = time.perf_counter()
+        
+        dur_build = (t3 - t2) * 1000
+        dur_search = (t4 - t3) * 1000
+        
+        print(f" > PyTorch (Brute) : {dur_torch:.3f} ms")
+        print(f" > FAISS (Build)   : {dur_build:.3f} ms")
+        print(f" > FAISS (Search)  : {dur_search:.3f} ms")
+        
+        # 4. Vérification de la Précision
+        idx_t = best_idx_torch.item()
+        idx_f = indices_faiss[0].item()
+        score_t = best_score_torch.item()
+        score_f = scores_faiss[0].item()
+        
+        print(f" > Résultat PyTorch : Index {idx_t} (Score {score_t:.4f})")
+        print(f" > Résultat FAISS   : Index {idx_f} (Score {score_f:.4f})")
+        
+        if idx_t == idx_f:
+            print(" [SUCCESS] FAISS est 100% précis (Match exact).")
+        elif abs(score_t - score_f) < 1e-5:
+            print(" [SUCCESS] FAISS est précis (Scores identiques, index équivalent).")
+        else:
+            print(" [FAIL] Divergence de résultats !")
+
+        speedup = dur_torch / dur_search if dur_search > 0 else 0
+        print(f" [BENCHMARK] Accélération Recherche : x{speedup:.1f}")
+        
+        
+    def test_lancedb_persistence(self):
+        print("\n--- 43. TEST LANCEDB PERSISTENCE (Stockage Physique) ---")
+        
+        # 1. Vérification Singleton
+        if not hasattr(self.brain.memory, 'db') or self.brain.memory.db is None:
+            print(" [INFO] LanceDB non actif ou connexion perdue. Test annulé.")
+            return
+
+        # 2. Création Témoin (Simulation d'un concept fort)
+        test_concept = "LanceDB_Test_Marker"
+        # Nettoyage préventif
+        old = self.brain.find_concept_exact(test_concept)
+        if old: self.brain.delete_node(old)
+            
+        print(f" > Création du concept témoin '{test_concept}'...")
+        c = self.brain.ensure_concept(test_concept)
+        c.energy = 123.45 
+        
+        # [ACTION MANUELLE DE TEST]
+        # On simule ici le travail que ferait le Stream (perceive) : 
+        # on ancre le vecteur dans la mémoire active.
+        self.brain.memory.update(test_concept, c.nature_vec)
+        
+        # 3. Force Sauvegarde (Le Sommeil)
+        print(" > Sauvegarde forcée vers LanceDB (Simulation Sommeil)...")
+        self.brain.memory.save_all()
+        
+        # 4. Vérification Physique
+        db_path = self.brain.cfg.LANCEDB_URI
+        if os.path.exists(db_path):
+            print(f" [SUCCESS] Le dossier DB existe : {db_path}")
+        else:
+            print(f" [FAIL] Dossier DB introuvable !")
+
+        # 5. Vérification Logique
+        print(" > Interrogation directe de la base...")
+        try:
+            tbl = self.brain.memory.db.open_table("concepts")
+            res = tbl.search().where(f"name = '{test_concept}'").limit(1).to_pandas()
+            
+            if not res.empty:
+                print(f" [SUCCESS] Donnée '{test_concept}' retrouvée dans la DB.")
+            else:
+                print(f" [FAIL] Donnée témoin absente.")
+        except Exception as e:
+            print(f" [FAIL] Erreur requête LanceDB : {e}")
+
+        # Nettoyage
+        if c: self.brain.delete_node(c)
+
+
 if __name__ == "__main__":
     
     Nb_DIM = 4096 #tested for: 64, 128, 256, 512, 1024, 2048, 4096
@@ -5012,6 +5387,7 @@ if __name__ == "__main__":
     try:
         if RUN_MODE == "DIAGNOSTIC":
             CFG.BASE_MEM_DIR = CFG.BASE_MEM_DIR + "_DIAG"
+            CFG.iniPath()
         
         brain = UnifiedBrain(str_lang, boolResetBase)
         bootloader = GenesisBootloader(CFG, brain)
