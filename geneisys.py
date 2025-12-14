@@ -64,7 +64,7 @@ author's availability. There is no pressure or timeline for updates.
 ================================================================================
 """
 
-strVersion = "0.0.96_16_15_06l_STABLE_alpha"
+strVersion = "0.0.96_16_15_06m_STABLE_alpha"
 
 
 import torch
@@ -353,6 +353,11 @@ class GenesisConfig:
         
         # --- ATTENTION SÉLECTIVE (Recap 12) ---
         self.TOP_K_LIMIT = 10  # Nombre max de voisins influents (Gravité Sparse)
+        
+        # --- CONFIGURATION PHYSIQUE SPARSE (100% Implémentée) ---
+        self.ENABLE_SPARSE_PHYSICS = True
+        self.SPARSE_K_NEIGHBORS = 5       # 5 Souvenirs par mot
+        self.CONTEXT_INFLUENCE = 0.1      # 10% de mélange (Coloration douce)
         
         
         # --- MVP98 : HEAVY BRIDGE CONFIG ---
@@ -1025,6 +1030,10 @@ class AssociativeMemory:
         return self.vocab_words[best_idx]
 
 
+
+
+
+
 # --- NOUVEAU MOTEUR D'INDEXATION (ÉTAPE 3) ---
 class FaissMemoryEngine:
     """
@@ -1092,6 +1101,132 @@ class FaissMemoryEngine:
             self.index.reset()
 
 
+class SparseGravityEngine:
+    """
+    [COMPLET] Moteur de Contextualisation Sémantique.
+    Utilise FAISS et le Mapping GPU pour "colorer" les vecteurs du batch
+    avec leurs associations mémorielles.
+    """
+    def __init__(self, brain):
+        self.brain = brain
+
+    def apply_context_pressure(self, active_vecs, active_words):
+        """
+        Entrée: Vecteurs du batch [N, Dim]
+        Sortie: Vecteurs modifiés [N, Dim] (mélangés avec le contexte)
+        """
+        n_active = active_vecs.shape[0]
+        # Sécurités de base
+        if n_active == 0: return active_vecs
+        if not self.brain.memory.search_engine.use_faiss: return active_vecs
+        if self.brain.memory.faiss_id_to_slot_tensor is None: return active_vecs
+
+        # [CORRECTION ROBUSTESSE] Détection des vecteurs vides (Norme proche de 0)
+        # On ne veut pas chercher de contexte pour du "vide".
+        input_norms = torch.norm(active_vecs, p=2, dim=1, keepdim=True)
+        # Masque [N, 1] : 1.0 si vecteur valide, 0.0 si vecteur nul
+        is_meaningful = (input_norms > 1e-6).float()
+
+        # Si tout est vide, on sort direct
+        if is_meaningful.sum() == 0:
+            return active_vecs
+
+
+
+        # 1. RECHERCHE FAISS (Voisins)
+        # indices_faiss: [N, K] (Contient des IDs FAISS abstraits, ou -1)
+        k = CFG.SPARSE_K_NEIGHBORS
+        scores, indices_faiss = self.brain.memory.search_engine.search(active_vecs, k)
+        
+        
+        # [SECURITE CPU/GPU]
+        # On s'assure que les indices reçus de FAISS sont sur le même device que notre Mapping Tensor
+        # Si on est en Full CPU, ça ne coûte rien. Si on est en GPU, ça transfère.
+        indices_faiss = indices_faiss.to(CFG.DEVICE)  # <--- AJOUT CRITIQUE
+        
+        
+        # 2. MAPPING (FAISS ID -> SLOT ID)
+        # C'est l'étape qui manquait souvent. Ici elle est vectorisée.
+        
+        # A. On aplatit pour traiter en masse
+        flat_faiss_ids = indices_faiss.view(-1) # [N*K]
+        
+        # B. On crée un masque pour ignorer les -1 (pas de voisin)
+        # et pour ignorer les IDs qui seraient hors range (sécurité)
+        max_id = self.brain.memory.faiss_id_to_slot_tensor.size(0)
+        mask_valid = (flat_faiss_ids >= 0) & (flat_faiss_ids < max_id)
+        
+        # C. On prépare le tenseur des slots mémoire (init à 0, mais on utilisera le masque)
+        # On utilise long() pour l'indexation
+        flat_slots = torch.zeros_like(flat_faiss_ids, dtype=torch.long)
+        
+        # D. TRADUCTION MAGIQUE (GPU Lookup)
+        # On ne traduit que ce qui est valide
+        if mask_valid.any():
+            valid_faiss_ids = flat_faiss_ids[mask_valid]
+            # Lookup dans le tenseur de mapping créé par HybridMemoryCluster
+            real_slots = self.brain.memory.faiss_id_to_slot_tensor[valid_faiss_ids]
+            flat_slots[mask_valid] = real_slots
+        else:
+            # Aucun voisin valide trouvé pour tout le batch (rare mais possible au début)
+            return active_vecs
+
+        # 3. GATHERING (Récupération des vecteurs souvenirs)
+        # On va chercher les vecteurs dans la mémoire principale (Fast Index)
+        # flat_slots contient les adresses physiques.
+        
+        # [N*K, Dim]
+        mem_vecs_flat = self.brain.memory.fast_index.index_select(0, flat_slots)
+        
+        # On remet les vecteurs à 0 là où le masque était invalide (pour ne pas polluer la moyenne)
+        # On étend le masque pour matcher la dimension [N*K, Dim]
+        mask_expanded = mask_valid.unsqueeze(1).expand_as(mem_vecs_flat)
+        mem_vecs_flat = mem_vecs_flat * mask_expanded.float() # Zéros si invalide
+        
+        # 4. PHYSIQUE (Moyenne Pondérée)
+        # On veut calculer une moyenne des K voisins pour chaque mot
+        
+        # Reshape [N, K, Dim]
+        mem_vecs_3d = mem_vecs_flat.view(n_active, k, -1)
+        
+        # Somme sur l'axe K (les voisins)
+        sum_context = torch.sum(mem_vecs_3d, dim=1) # [N, Dim]
+        
+        # Comptage des voisins valides pour faire la moyenne
+        # mask_valid view [N, K] -> somme sur K -> [N, 1]
+        count_valid = mask_valid.view(n_active, k).sum(dim=1).unsqueeze(1).float()
+        count_valid = torch.clamp(count_valid, min=1.0) # Eviter division par zero
+        
+        avg_context = sum_context / count_valid
+        
+        # Normalisation du contexte moyen (Important pour la physique sémantique)
+        avg_context = torch.nn.functional.normalize(avg_context, p=2, dim=1, eps=CFG.EPSILON)
+        
+        # 5. APPLICATION (Mélange)
+        # Formule : Nouveau = (Ancien * (1-Alpha)) + (Contexte * Alpha)
+        alpha = CFG.CONTEXT_INFLUENCE
+        
+        # On s'assure que tout est sur le bon device et type
+        active_vecs = active_vecs.to(CFG.COMPUTE_DTYPE)
+        avg_context = avg_context.to(CFG.COMPUTE_DTYPE).to(active_vecs.device)
+        
+        # Application uniquement là où on a trouvé du contexte (count > 0)
+        # Sinon on garde l'original pur.
+        has_context_mask = (mask_valid.view(n_active, k).sum(dim=1).unsqueeze(1) > 0).float()
+        
+        blended_vecs = (active_vecs * (1.0 - alpha)) + (avg_context * alpha)
+        
+        # Selection finale : Mélange si contexte, sinon Original
+        final_vecs = (blended_vecs * has_context_mask) + (active_vecs * (1.0 - has_context_mask))
+        
+        # [CORRECTION FINALE] : Application du Masque de Sens
+        # Si le vecteur d'entrée était nul, le vecteur de sortie DOIT rester nul.
+        final_vecs = final_vecs * is_meaningful
+        
+        
+        return torch.nn.functional.normalize(final_vecs, p=2, dim=1, eps=CFG.EPSILON)
+
+
 class HybridMemoryCluster:
     # --- SINGLETON DE CONNEXION (Partagé par toutes les instances) ---
     # Permet de survivre au 'del self.brain' et au 'optimize_memory_layout'
@@ -1132,6 +1267,8 @@ class HybridMemoryCluster:
         self.search_engine = FaissMemoryEngine(dim)
         self.faiss_dirty = False # Le Flag qui évite les recalculs inutiles
         self.faiss_id_to_slot = [] # Le mapping pour gérer les trous de mémoire
+        self.faiss_id_to_slot_tensor = None  # Version Tenseur (GPU/Fast)
+        
         self._init_shared_db()
         self._inventory_disk()
         
@@ -1143,58 +1280,54 @@ class HybridMemoryCluster:
     
     def _sync_faiss_if_needed(self):
         """
-        Reconstruit l'index FAISS uniquement si nécessaire (Lazy Rebuild).
-        Gère la correspondance entre les IDs FAISS (0..N) et les Slots Mémoire (ex: 12, 500, 502...).
+        [UNIVERSEL] Reconstruit FAISS et le Mapping Tensoriel.
+        Compatible CPU-only et GPU Hybride.
         """
-        # Si rien n'a bougé, on ne fait rien (Performance max)
-        if not self.faiss_dirty:
-            return
+        if not self.faiss_dirty: return
 
-        # Si la mémoire est vide, on reset juste
+        # CAS 1 : RESET
         if not self.name_to_idx:
-            # Assurez-vous que FaissMemoryEngine a une méthode reset() ou clear()
-            if hasattr(self.search_engine, 'reset'):
-                self.search_engine.reset()
+            if hasattr(self.search_engine, 'reset'): self.search_engine.reset()
             self.faiss_dirty = False
-            self.faiss_id_to_slot = []
+            self.faiss_id_to_slot_tensor = None 
+            self.faiss_id_to_slot = [] 
             return
 
-        # --- RECONSTRUCTION INTELLIGENTE ---
-        
-        # 1. On récupère la liste des slots valides (ceux qui contiennent des vecteurs actifs)
-        # self.name_to_idx contient { "Key": Slot_ID }
+        # CAS 2 : RECONSTRUCTION
         valid_indices = list(self.name_to_idx.values())
-        
         if not valid_indices:
             self.faiss_dirty = False
             return
 
-        # 2. On extrait les vecteurs correspondants depuis le GPU/RAM
-        # On utilise index_select pour prendre uniquement les vecteurs valides et ignorer les trous/déchets
-        indices_tensor = torch.tensor(valid_indices, device=CFG.INDEX_DEVICE, dtype=torch.long)
+        # 1. Création du Tenseur de Mapping sur le DEVICE DE CALCUL
+        # Si on est full CPU, ce sera 'cpu'. Si on est GPU, ce sera 'cuda'.
+        indices_tensor = torch.tensor(valid_indices, device=CFG.DEVICE, dtype=torch.long)
         
-        # On extrait les données brutes (FP16/FP32)
-        active_vectors = self.fast_index.index_select(0, indices_tensor)
+        # 2. Pour nourrir FAISS, on a besoin des vecteurs
+        # Attention : self.fast_index est peut-être sur un autre device (INDEX_DEVICE)
+        # On gère le transfert proprement.
+        idx_device = self.fast_index.device
+        indices_for_extract = indices_tensor.to(idx_device)
+        active_vectors = self.fast_index.index_select(0, indices_for_extract)
 
-        # 3. Reset et Remplissage
-        # On suppose que votre FaissMemoryEngine a une méthode reset() et add()
-        # Si elle s'appelle autrement (ex: build_index), adaptez ici.
-        if hasattr(self.search_engine, 'reset'):
-             self.search_engine.reset()
+        # 3. Nourrir FAISS
+        if hasattr(self.search_engine, 'reset'): self.search_engine.reset()
         
-        # On ajoute les vecteurs. FAISS va leur donner des IDs implicites 0, 1, 2, 3...
-        # Note : active_vectors doit peut-être être converti en CPU ou Numpy selon votre FaissMemoryEngine
-        # Si votre FaissMemoryEngine attend du Torch GPU, c'est bon.
-        # Sinon (si elle attend du Numpy), ajoutez .cpu().numpy()
-        self.search_engine.add_vectors(active_vectors) 
+        # FAISS CPU attend souvent du CPU/Numpy, alors que FAISS GPU attend du Torch GPU
+        # Le Wrapper FaissMemoryEngine devrait gérer, mais par sécurité avec faiss-cpu :
+        if "cpu" in str(CFG.DEVICE).lower() or not CFG.USE_CUDA:
+             # Force CPU pour faiss-cpu standard
+             self.search_engine.add_vectors(active_vectors.cpu()) 
+        else:
+             # Tente l'ajout direct (le wrapper gérera si besoin conversion numpy)
+             self.search_engine.add_vectors(active_vectors)
+
+        # 4. Sauvegarde du Mapping (Sur le Device de Calcul Principal)
+        # C'est ce tenseur qui permettra au moteur physique d'aller vite.
+        self.faiss_id_to_slot_tensor = indices_tensor 
         
-        # 4. Sauvegarde du Mapping
-        # Le vecteur FAISS ID 0 correspond au valid_indices[0] (Slot 12 par exemple)
-        # Le vecteur FAISS ID 1 correspond au valid_indices[1] (Slot 500 par exemple)
         self.faiss_id_to_slot = valid_indices 
-        
         self.faiss_dirty = False
-        # print(f" [DEBUG] FAISS Rebuilt ({len(valid_indices)} vectors).")
     
     
     @classmethod
@@ -3169,6 +3302,7 @@ class SensoryStream:
     def __init__(self, brain):
         self.brain = brain
         self.phys_engine = ChunkedGravityEngine(brain.dim, max_capacity=CFG.PHYSICS_STATIC_BUFFER_SIZE)
+        self.sparse_engine = SparseGravityEngine(brain)
         self.MAX_LEN = CFG.MAX_SEQUENCE_LENGTH
         D = brain.dim
         self.vecs_buffer = torch.zeros((self.MAX_LEN, D), dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
@@ -3474,6 +3608,17 @@ class SensoryStream:
         vecs_slice = self.vecs_buffer[:n]
         pos_slice = self.positions_buffer[:n]
         current_words = self.word_tokens[:n]
+        
+        # --- [INTEGRATION SPARSE PHYSICS] ---
+        # C'est ici le point d'injection idéal.
+        # On modifie 'vecs_slice' pour qu'il contienne l'influence du passé.
+        # Le reste de la fonction utilisera cette version enrichie.
+        if CFG.ENABLE_SPARSE_PHYSICS and hasattr(self, 'sparse_engine'):
+             vecs_slice = self.sparse_engine.apply_context_pressure(vecs_slice, current_words)
+        # ------------------------------------
+        
+        
+        
         ops = [None] * n
         op_dirs = [None] * n
         
@@ -4833,6 +4978,7 @@ class GenesisDiagnostic:
         self.test_lancedb_persistence()
         self.test_lancedb_startup_load()
         self.test_lazy_memory_performance()
+        self.test_sparse_physics_logic()
         print("\n=== Fin Diagnostic ===")
     
     def forensic_audit_ghosts(self):
@@ -6089,6 +6235,66 @@ class GenesisDiagnostic:
         else: print(" [FAIL] Perte de données.")
         
         if mem.db: mem.db.drop_table("test_swap")
+        
+        
+    def test_sparse_physics_logic(self):
+        print("\n--- 46. TEST LOGIQUE SPARSE PHYSICS (FAISS + MAPPING) ---")
+        
+        # 1. Vérification de l'activation
+        if not CFG.ENABLE_SPARSE_PHYSICS:
+            print(" [SKIP] Sparse Physics désactivé dans la config.")
+            return
+            
+        if not hasattr(self.brain.stream, 'sparse_engine'):
+            print(" [FAIL] Sparse Engine non instancié dans SensoryStream.")
+            return
+
+        print(" > Injection de données sémantiques (Création de Contexte)...")
+        # On injecte des concepts proches pour que FAISS ait de la matière
+        corpus = ["Le chat mange.", "Le félin chasse.", "Le lion dort.", "La voiture roule."]
+        # On force l'apprentissage immédiat
+        for phrase in corpus:
+            self.brain.perceive(phrase)
+            
+        # On force la synchro FAISS pour mettre à jour l'index et le Tenseur de Mapping
+        self.brain.memory.faiss_dirty = True
+        self.brain.memory._sync_faiss_if_needed()
+        
+        print(f" > Index FAISS taille : {self.brain.memory.search_engine.index.ntotal}")
+        print(f" > Mapping Tensor taille : {len(self.brain.memory.faiss_id_to_slot_tensor)}")
+
+        # 2. Test du Mapping (FAISS ID -> SLOT)
+        # On prend un ID au hasard dans FAISS (ex: 0)
+        test_faiss_id = 0
+        real_slot = self.brain.memory.faiss_id_to_slot_tensor[test_faiss_id].item()
+        print(f" > Vérification Mapping : FAISS ID {test_faiss_id} -> Slot {real_slot}")
+        
+        # 3. Simulation d'un vecteur "Chat" (qui devrait rappeler "Félin" et "Lion")
+        # On encode manuellement
+        vec_chat = self.brain.encoder.encode_word("chat", 0).unsqueeze(0) # [1, Dim]
+        
+        # 4. Application de la Pression Contextuelle
+        print(" > Application de la pression contextuelle...")
+        vec_modifie = self.brain.stream.sparse_engine.apply_context_pressure(vec_chat.clone(), ["chat"])
+        
+        # 5. Mesure de l'impact
+        dist = torch.dist(vec_chat, vec_modifie).item()
+        print(f" > Distance (Original vs Modifié) : {dist:.6f}")
+        
+        if dist > 0.0001:
+            print(" [SUCCESS] Le contexte a modifié le vecteur (Gravité Sémantique active).")
+        else:
+            print(" [WARN] Le vecteur n'a pas bougé (Pas de voisins trouvés ou Influence nulle).")
+            # Ce n'est pas forcément un échec si le contexte est vide ou trop loin, 
+            # mais avec notre corpus "Chat/Félin", ça devrait bouger.
+            
+        # 6. Test de Robustesse (Vecteur vide / Inconnu)
+        vec_vide = torch.zeros_like(vec_chat)
+        vec_mod_vide = self.brain.stream.sparse_engine.apply_context_pressure(vec_vide, ["rien"])
+        if torch.equal(vec_vide, vec_mod_vide):
+             print(" [SUCCESS] Robustesse validée (Pas d'effet sur vecteur nul).")
+        else:
+             print(" [FAIL] Le moteur a modifié un vecteur nul (Comportement imprévu).")
 
 if __name__ == "__main__":
     
