@@ -2360,7 +2360,7 @@ class MatrixEncoder(nn.Module):
         self.semantic_map[key_concept] = new_va.to(dtype=CFG.COMPUTE_DTYPE)
         
         # 2. Mise à jour mémoire centrale (On passe new_va, pas self.get_semantic_vector(wa))
-        self.brain.memory.update(wa, new_va, layer_type)
+        self.brain.memory.update(wa, new_va, layer_type_wa)
         # -----------------------------------------------
         
         self.brain.associative_memory.is_dirty = True
@@ -6373,4 +6373,5 @@ if __name__ == "__main__":
         # Peu importe si on a 1 cerveau, 10 threads ou si ça a planté,
         # la Config connait tout le monde et éteint la lumière.
         GenesisConfig.global_shutdown()
+
 
