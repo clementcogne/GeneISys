@@ -64,7 +64,7 @@ author's availability. There is no pressure or timeline for updates.
 ================================================================================
 """
 
-strVersion = "0.0.97_STABLE_alpha"
+strVersion = "0.0.96_16_15_06nQ_23_STABLE_alpha"
 
 
 import torch
@@ -165,7 +165,7 @@ class GenesisConfig:
     # --- REGISTRE DES THREADS ACTIFS (Pattern Pool) ---
     RUNNING_THREADS = []
 
-    def __init__(self, dim=4096, shard_count=5, PrecisionType="FP32", ForceCPU = False,str_version=f'GENEISIS MVP{strVersion} (Performance & Hardening)', ENABLE_MULTITHREADING = True, FORCE_LIGHT_MODE = False):
+    def __init__(self, dim=4096, shard_count=5, PrecisionType="FP32", ForceCPU = False,str_version=f'GENEISIS MVP{strVersion} (Performance & Hardening)', ENABLE_MULTITHREADING = True, FORCE_LIGHT_MODE = False, SPATIAL_DIM=128, CUDA_GRAPH_WINDOW_SIZE = 4096):
         if ForceCPU:
             self.DEVICE = torch.device("cpu")
         else:
@@ -185,6 +185,21 @@ class GenesisConfig:
         self.DIM_SIZE = dim
         self.SHARD_COUNT = shard_count
         
+        # Dans la classe CFG:
+        # Taille de la fenêtre de calcul (La "Caméra").
+        # 40000² * 4 octets = ~6.4 Go de matrice interne. Ça passe large sur ta 5080 (16Go).
+        self.CUDA_GRAPH_WINDOW_SIZE = CUDA_GRAPH_WINDOW_SIZE
+                
+        
+        # [NOUVEAU] DIMENSION SPATIALE (Physique)
+        # Peut être différent de la DIM sémantique (4096). 
+        # 128 est suffisant pour une physique riche sans tuer la RAM.
+        self.SPATIAL_DIM = 128  
+        
+        # Seuil de mouvement pour déclencher une écriture LanceDB (Distance Euclidienne)
+        self.PHYSICS_WRITE_THRESHOLD = 0.05
+        self.PHYSICS_STATE_TABLE = "physics_state"
+        self.SEMANTIC_STATE_TABLE = "semantic_state"
         # Calcul des ratios pour adapter la physique si on n'est pas en 4096
         DIM_REFERENCE = 4096.0
         ratio = self.DIM_SIZE / DIM_REFERENCE
@@ -404,6 +419,101 @@ class GenesisConfig:
         print(f" [CONFIG] Architecture Ingestion Active : {mode_str}")
             
         
+        """
+        
+        if name == "LEGACY":
+            # [COMPORTEMENT VERSION N]
+            # On active uniquement la Gravité Newtonienne.
+            # On coupe le Magnétisme (qui causait les hallucinations Poison->Poison)
+            self.base_weights["GRAVITY_KERNEL"] = 1.0
+            self.base_weights["MAGNETISM"] = 0.0 
+            self.base_weights["QUANTUM"] = 0.0
+            self.base_weights["ENTROPY"] = 0.0 # Pas de decay complexe dans le calcul de force immédiat
+            print(f" [PHYSICS] Context switched to LEGACY (Newtonian Only)")
+            
+        elif name == "STANDARD":
+            # Le profil par défaut de la version P (Mélange instable pour l'instant)
+            self.base_weights["GRAVITY_KERNEL"] = 0.6
+            self.base_weights["MAGNETISM"] = 0.4
+        elif name == "ORBITAL_LIFE": 
+            # LE PROFIL DE LA RÉALITÉ STABLE (MOUVEMENT PERPÉTUEL)
+            # 1. Structure
+            self.base_weights["GRAVITY"] = 1.0
+            # 2. Le Frein (Dissipation)
+            self.base_weights["THERMO"] = 0.5 
+            # 3. Le Moteur (Injection d'Énergie)
+            # Si Moteur ~= Frein, alors Vitesse = Constante > 0
+            self.base_weights["QUANTUM"] = 0.5  # Chaleur
+            self.base_weights["FLUIDS"] = 0.2   # Courant
+            
+        elif name == "DREAM_CHAOS":
+            # Beaucoup de moteur, peu de frein
+            self.base_weights["GRAVITY"] = 0.5
+            self.base_weights["QUANTUM"] = 2.0
+            self.base_weights["THERMO"] = 0.1
+            
+        elif name == "DEEP_FREEZE":
+            # Beaucoup de frein, zéro moteur (Maths)
+            self.base_weights["THERMO"] = 2.0
+            self.base_weights["ACTION"] = 1.0
+            self.base_weights["STRONG"] = 5.0 # Liaison rigide
+        
+        """
+        self.DEFAULT_FIELD = "LEGACY"
+        self.PARAM_FIELD = { "LEGACY" : {
+                                                # On active uniquement la Gravité Newtonienne.
+                                                # On coupe le Magnétisme (qui causait les hallucinations Poison->Poison)
+                                                "GRAVITY_KERNEL" : 1.0,
+                                                "MAGNETISM" : 0.0,
+                                                "QUANTUM" : 0.0,
+                                                "ENTROPY" : 0.0 # Pas de decay complexe dans le calcul de force immédiat
+                                            },
+                             "STANDARD" : {
+                                                # Le profil par défaut de la version P (Mélange instable pour l'instant)
+                                                "GRAVITY_KERNEL" : 0.6,
+                                                "MAGNETISM" : 0.4
+                                            },
+                             "ORBITAL_LIFE" : {
+                                                # LE PROFIL DE LA RÉALITÉ STABLE (MOUVEMENT PERPÉTUEL)
+                                                # 1. Structure
+                                                "GRAVITY" : 1.0,
+                                                # 2. Le Frein (Dissipation)
+                                                "THERMO" : 0.5,
+                                                # 3. Le Moteur (Injection d'Énergie)
+                                                # Si Moteur ~= Frein, alors Vitesse = Constante > 0
+                                                "QUANTUM" : 0.5,  # Chaleur,
+                                                "FLUIDS" : 0.2   # Courant
+                                            },
+                             "DREAM_CHAOS" : {
+                                                # Beaucoup de moteur, peu de frein
+                                                "GRAVITY" : 0.5,
+                                                "QUANTUM" : 2.0,
+                                                "THERMO" : 0.1
+                                            },
+                             "DEEP_FREEZE" : {
+                                                # Beaucoup de frein, zéro moteur (Maths)
+                                                "THERMO" : 2.0,
+                                                "ACTION" : 1.0,
+                                                "STRONG" : 5.0 # Liaison rigide
+                                            },
+                             "NONE" : {
+                                                "GRAVITY": 0.0,
+                                                "GRAVITY_legacy": 0.0,
+                                                "GRAVITY_KERNEL": 0.0,
+                                                "THERMO": 0.0,
+                                                "RELATIVITY": 0.0,
+                                                "QUANTUM": 0.0,
+                                                "ELECTRO": 0.0,
+                                                "STRONG": 0.0,
+                                                "ACTION": 0.0,
+                                                "FLUIDS": 0.0
+                                            }
+                            }
+        
+        
+        
+        
+        
         
         
         self._calculate_dimensional_params()
@@ -472,6 +582,603 @@ class GenesisConfig:
 
 #first call for function declaration when CFG.X is a default value
 CFG = GenesisConfig()
+
+
+
+
+
+# ==============================================================================
+#  MODULE: SEMANTIC PHYSICS CORE (The 8 Pillars - PURE MATHS)
+# ==============================================================================
+import torch
+import torch.nn.functional as F
+
+class PhysicsLaw:
+    """Interface stateless pour une loi physique vectorisée."""
+    def __init__(self, name): self.name = name
+    def compute_forces(self, vectors, positions, masses, velocities, weight, mask, context=None):
+        return torch.zeros_like(positions)
+
+# --- 1. GRAVITÉ (Newton) ---
+class LawGravity(PhysicsLaw):
+    def __init__(self): super().__init__("GRAVITY")
+    def compute_forces(self, vectors, positions, masses, velocities, weight, mask, context=None):
+        if weight < 1e-4: return torch.zeros_like(positions)
+        
+        # Sécurisation des dimensions : On veut [N, 1]
+        if masses.dim() == 1: masses = masses.unsqueeze(1)
+        
+        diff = positions.unsqueeze(1) - positions.unsqueeze(0)
+        dist_sq = torch.sum(diff**2, dim=2, keepdim=True) + 1e-6
+        
+        # Produit des masses : [N, 1] * [1, N] -> [N, N]
+        mass_prod = masses @ masses.t()
+        
+        # On ajoute la dimension pour matcher dist_sq : [N, N, 1]
+        mass_prod = mass_prod.unsqueeze(2)
+        
+        # F = G * (m1*m2) / d^2
+        # [N, N, 1] / [N, N, 1] -> [N, N, 1]
+        force_mag = (mass_prod) / dist_sq
+        
+        direction = diff / (torch.sqrt(dist_sq) + 1e-6)
+        
+        # [N, N, 1] * [N, N, D] -> [N, N, D] -> Somme -> [N, D]
+        # Note : On a RETIRÉ le .unsqueeze(2) du return car force_mag est déjà correct
+        
+        forces = torch.sum(force_mag * direction, dim=1)
+        
+        if mask is not None:
+            forces = forces * mask
+        
+        forces.fill_diagonal_(0.0)
+        
+        return forces
+        
+    
+    
+class LawGravity_Legacy(PhysicsLaw):
+    def __init__(self): super().__init__("GRAVITY_legacy")
+    def compute_forces(self, vectors, positions, masses, velocities, mask, weight, context=None):
+        """
+        Implémentation critique : Doit utiliser la distance Euclidienne (cdist).
+        Si l'ancien dev a mis 'torch.mm' (dot product) ici, c'est ça la régression.
+        """
+        if weight < 1e-4: return torch.zeros_like(positions)
+        # Normalisation (Important pour la stabilité)
+        vec_norm = F.normalize(vectors, p=2, dim=1, eps=CFG.EPSILON)
+        
+        # 1. Matrice de Distance (Euclidienne = Vraie distance physique)
+        dists = torch.cdist(vec_norm, vec_norm, p=2)
+        
+        # 2. Matrice de Masses (m1 * m2)
+        # masses est attendu comme tenseur (n,)
+        m_col = masses.unsqueeze(0)
+        m_row = masses.unsqueeze(1)
+        mass_prod = m_row * m_col
+        
+        # 3. Formule de Newton : F = (G * m1 * m2) / r
+        # On ajoute epsilon pour éviter division par zéro
+        # Note: G est géré par le poids du profil
+        forces = mass_prod / (dists + 1e-6)
+        
+        if mask is not None:
+            forces = forces * mask
+        
+        forces.fill_diagonal_(0.0)
+        
+        return forces
+        
+
+class gravity_kernel_masked_symmetric_Class(PhysicsLaw):
+    def __init__(self): super().__init__("GRAVITY_KERNEL")
+    def compute_forces(self, vectors, positions, masses, velocities, mask, weight, context=None):
+        """
+        Noyau Physique Unifié (CPU/GPU Compatible).
+        Utilise la similarité Cosine et le Clamping pour la stabilité numérique.
+        Remplace l'ancienne logique dot-product pure qui causait des NaN.
+        """
+        if weight < 1e-4: return torch.zeros_like(positions)
+        # 1. Normalisation pour stabilité (Cosine Similarity)
+        # eps=1e-8 évite la division par zéro si un vecteur est nul
+        vecs_norm = F.normalize(vectors, p=2, dim=1, eps=CFG.EPSILON)
+        
+        # 2. Similarité Matricielle (Optimisé AVX2 sur CPU, CUDA Cores sur GPU)
+        sim_matrix = torch.mm(vecs_norm, vecs_norm.t())
+        
+        # 3. Sécurité Numérique (Clamping)
+        # Empêche les valeurs > 1.0 ou < -1.0 qui font exploser le .pow(3)
+        sim_safe = torch.clamp(sim_matrix, CFG.FORCE_CLAMP_MIN, CFG.FORCE_CLAMP_MAX)
+        
+        # 3. Distance Sémantique OPTIMISÉE (Memory Safe) 
+        # Au lieu de calculer le tenseur de différence [N, N, D] (qui pèse 64Go pour N=2000),
+        # on utilise cdist qui calcule directement la matrice [N, N] (16Mo pour N=2000).
+        # p=2 correspond à la distance Euclidienne (Norme L2).
+        if positions.device.type == 'cpu' and positions.dtype == torch.float16:
+             calc_pos = positions.float()
+        else:
+             calc_pos = positions
+        
+        
+        dist_matrix = torch.cdist(calc_pos, calc_pos, p=2) + CFG.PHYSICS_EPSILON
+        
+        # 4. Calcul de la Gravité
+        # Masses est [N] ou [N, 1]. On veut [N, N].
+        if masses.dim() == 2: masses = masses.squeeze(1) # Sécurité
+        mass_prod = masses.unsqueeze(1) * masses.unsqueeze(0) # [N, N]
+        
+        # (Sim + 1)^3 permet de favoriser fortement les concepts proches
+        numerator = mass_prod * (sim_safe + 1.0).pow(CFG.SIMILARITY_POWER)
+        forces = numerator / dist_matrix
+        
+        if mask is not None:
+            forces = forces * mask
+            
+        forces.fill_diagonal_(0.0)
+        return forces
+    
+
+# --- 2. THERMODYNAMIQUE (Pure Friction) ---
+class LawThermodynamics(PhysicsLaw):
+    def __init__(self): super().__init__("THERMO")
+    def compute_forces(self, vectors, positions, masses, velocities, mask, weight, context=None):
+        if weight < 1e-4: return torch.zeros_like(positions)
+        
+        # Friction : S'oppose à la vitesse
+        friction = -1.0 * velocities
+        
+        # Rappel : S'oppose à l'éloignement (Ressort vers 0)
+        rappel = -0.05 * positions
+        forces = friction + rappel
+        return forces
+
+# --- 3. RELATIVITÉ (Masse apparente) ---
+class LawRelativity(PhysicsLaw):
+    def __init__(self): super().__init__("RELATIVITY")
+    def compute_forces(self, vectors, positions, masses, velocities, mask, weight, context=None):
+        if weight < 1e-4: return torch.zeros_like(positions)
+        
+        if masses.dim() == 1: masses = masses.unsqueeze(1)
+        
+        gamma = 1.0 + torch.norm(velocities, dim=1, keepdim=True)
+        # Masse relativiste : [N, 1] * [N, 1] -> [N, 1]
+        rel_mass = masses * gamma
+        
+        diff = positions.unsqueeze(1) - positions.unsqueeze(0)
+        dist_sq = torch.sum(diff**2, dim=2, keepdim=True) + 1e-6
+        
+        # Produit relativiste : [N, N] -> [N, N, 1]
+        mass_prod = (rel_mass @ rel_mass.t()).unsqueeze(2)
+        
+        force = mass_prod / dist_sq
+        direction = diff / (torch.sqrt(dist_sq) + 1e-6)
+        
+        forces = torch.sum(force * direction, dim=1) * 0.1
+        if mask is not None:
+            forces = forces * mask
+        
+        forces.fill_diagonal_(0.0)
+        
+        
+        return forces
+
+# --- 4. QUANTIQUE (Bruit Stochastique) ---
+class LawQuantum(PhysicsLaw):
+    def __init__(self): super().__init__("QUANTUM")
+    def compute_forces(self, vectors, positions, masses, velocities, mask, weight, context=None):
+        if weight < 1e-4: return torch.zeros_like(positions)
+        
+        # CORRECTION CRITIQUE : Alignement des masses [N, 1]
+        if masses.dim() == 1: masses = masses.unsqueeze(1)
+        
+        # Force aléatoire (Moteur thermique)
+        noise = torch.randn_like(positions)
+        
+        # Les objets lourds bougent moins (Inertie thermique)
+        # Maintenant que masses est [N, 1], la division se fait ligne par ligne
+        scale = 1 / (masses + 0.1)
+        
+        # [N, 4096] * [N, 1] -> OK
+        forces = noise * scale
+        
+        if mask is not None:
+            forces = forces * mask
+        
+        forces.fill_diagonal_(0.0)
+        
+        
+        return forces
+
+# --- 5. ÉLECTROMAGNÉTISME (Charge Sémantique) ---
+class LawElectroMagnetism(PhysicsLaw):
+    def __init__(self): super().__init__("ELECTRO")
+    def compute_forces(self, vectors, positions, masses, velocities, mask, weight, context=None):
+        if weight < 1e-4: return torch.zeros_like(positions)
+        
+        vec_norm = F.normalize(vectors, p=2, dim=1, eps=CFG.EPSILON)
+        similarity = torch.mm(vec_norm, vec_norm.t())
+        
+        # On passe le masque en [N, N, 1] pour la multiplication finale
+        repulsion_mask = (similarity < -0.1).float().unsqueeze(2)
+        
+        diff = positions.unsqueeze(1) - positions.unsqueeze(0)
+        dist_sq = torch.sum(diff**2, dim=2, keepdim=True) + 1e-6
+        direction = diff / (torch.sqrt(dist_sq) + 1e-6)
+        
+        # Force : [N, N] -> [N, N, 1]
+        force_mag = (similarity.unsqueeze(2)) / dist_sq
+        
+        forces = torch.sum(force_mag * direction * repulsion_mask, dim=1)
+        
+        if mask is not None:
+            forces = forces * mask
+        
+        forces.fill_diagonal_(0.0)
+        
+        
+        return forces
+
+# --- 6. NUCLÉAIRE FORT (Gluons / Grammaire) ---
+class LawStrongNuclear(PhysicsLaw):
+    def __init__(self): super().__init__("STRONG")
+    def compute_forces(self, vectors, positions, masses, velocities, mask, weight, context=None):
+        if weight < 1e-4: return torch.zeros_like(positions)
+        # Force de liaison massive à très courte portée (Binding)
+        diff = positions.unsqueeze(1) - positions.unsqueeze(0)
+        dist = torch.norm(diff, dim=2, keepdim=True)
+        # Potentiel de Yukawa : Active si d < 0.2
+        mask_close = (dist < 0.2) & (dist > 0.01)
+        force_mag = torch.exp(-dist) * 10.0
+        direction = diff / (dist + 1e-6)
+        
+        forces = torch.sum(force_mag * direction * mask_close.float(), dim=1)
+        
+        if mask is not None:
+            forces = forces * mask
+        
+        forces.fill_diagonal_(0.0)
+        
+        return forces
+
+# --- 7. MOINDRE ACTION (Économie) ---
+class LawLeastAction(PhysicsLaw):
+    def __init__(self): super().__init__("ACTION")
+    def compute_forces(self, vectors, positions, masses, velocities, mask, weight, context=None):
+        if weight < 1e-4: return torch.zeros_like(positions)
+        
+        # Freinage Quadratique (Drag) : F = -v * |v|
+        # On s'assure que la norme est [N, 1]
+        v_norm = torch.norm(velocities, dim=1, keepdim=True)
+        
+        # [N, 4096] * [N, 1] * scalaire -> OK
+        forces = -1.0 * velocities * v_norm
+        
+        if mask is not None:
+            forces = forces * mask
+        
+        forces.fill_diagonal_(0.0)
+        
+        
+        return forces
+
+# --- 8. FLUIDES (Flux Global) ---
+class LawFluids(PhysicsLaw):
+    def __init__(self): super().__init__("FLUIDS")
+    def compute_forces(self, vectors, positions, masses, velocities, mask, weight, context=None):
+        if weight < 1e-4: return torch.zeros_like(positions)
+        # Entraînement par le flux moyen (Cohérence de groupe)
+        mean_velocity = torch.mean(velocities, dim=0, keepdim=True)
+        forces = (mean_velocity - velocities)
+        
+        if mask is not None:
+            forces = forces * mask
+        
+        forces.fill_diagonal_(0.0)
+        
+        return forces
+
+
+# ==============================================================================
+#  MODULE: CONTEXT & PROFILES (The Mixer)
+# ==============================================================================
+class UniversalPhysicsContext:
+    def __init__(self, name="ORBITAL_LIFE"):
+        self.laws = {
+            "GRAVITY": LawGravity(),
+            "GRAVITY_legacy": LawGravity_Legacy(),
+            "GRAVITY_KERNEL": gravity_kernel_masked_symmetric_Class(),
+            "THERMO": LawThermodynamics(),
+            "RELATIVITY": LawRelativity(),
+            "QUANTUM": LawQuantum(),
+            "ELECTRO": LawElectroMagnetism(),
+            "STRONG": LawStrongNuclear(),
+            "ACTION": LawLeastAction(),
+            "FLUIDS": LawFluids()
+        }
+        self.base_weights = {}
+        self.layers = {}
+        # Initialisation par défaut
+        self.set_profile(name)
+        
+        for k in self.laws:
+            if TORCH_COMPILE_AVAILABLE:
+                try:
+                    compiled_method = torch.compile(self.laws[k].compute_forces, mode="reduce-overhead")
+                    self.laws[k].compute_forces = compiled_method
+                except Exception:
+                    self.laws[k] = self.laws[k]
+            else:
+                self.laws[k] = self.laws[k] 
+        
+
+    def set_profile(self, name):
+        """
+        Définit l'équilibre énergétique global.
+        C'est ici qu'on crée la 'Vie' (Équilibre Thermo vs Quantique).
+        """
+        self.base_weights = {k: 0.0 for k in self.laws}
+        
+        if name in CFG.PARAM_FIELD:
+            LayerFieldValue = CFG.PARAM_FIELD[name]
+        else:
+            LayerFieldValue = CFG.PARAM_FIELD["NONE"]
+        
+        for NameLayerField in LayerFieldValue:
+            self.base_weights[NameLayerField] = LayerFieldValue[NameLayerField]
+        
+
+    def add_layer(self, name, weights): self.layers[name] = weights
+    def remove_layer(self, name): self.layers.pop(name, None)
+    
+    
+    
+    def compute_all_forces(self, vecs, pos, mass, vels, mask=None):
+        # 1. Préparation
+        n, d = vecs.shape
+        # Accumulateur A : Le Graphe des Relations (Pour le Cerveau/Parseur)
+        acc_relations = torch.zeros((n, n), device=vecs.device, dtype=vecs.dtype)
+        # Accumulateur B : Le Vecteur Moteur (Pour la Physique/Euler)
+        acc_movement = torch.zeros((n, d), device=vecs.device, dtype=vecs.dtype)
+
+        # Calcul des poids des layers...
+        final = self.base_weights.copy()
+        for layer in self.layers.values():
+            for k, v in layer.items(): final[k] = max(0.0, final.get(k, 0) + v)
+
+        # 2. LA BOUCLE UNIVERSELLE
+        for name, law in self.laws.items():
+            w = final.get(name, 0.0)
+            if w > 1e-4:
+                # La loi calcule ce qu'elle veut.
+                # Elle peut renvoyer une Matrice, un Vecteur, ou un Tuple des deux.
+                raw_output = law.compute_forces(vecs, pos, mass, vels, mask, w)
+                
+                # --- DISPATCH INTELLIGENT (Tri par forme) ---
+                
+                # Cas 1 : La loi renvoie un Tuple (Relations, Mouvement)
+                if isinstance(raw_output, tuple):
+                    r, m = raw_output
+                    if r is not None: acc_relations += r * w
+                    if m is not None: acc_movement += m * w
+
+                # Cas 2 : La loi renvoie une Matrice [N, N] (ex: Gravité pure)
+                elif raw_output.dim() == 2 and raw_output.shape == (n, n):
+                    acc_relations += raw_output * w
+                    
+                    # OPTIONNEL : Si tu veux que la Gravité bouge les objets,
+                    # tu peux projeter ici, ou laisser le moteur le faire à la fin.
+                    # Pour l'instant, on sépare bien les rôles.
+
+                # Cas 3 : La loi renvoie un Vecteur [N, D] (ex: Friction, Vent)
+                elif raw_output.dim() == 2 and raw_output.shape == (n, d):
+                    acc_movement += raw_output * w
+
+        # 3. PROJECTION FINALE (Le lien Physique -> Mouvement)
+        # Si on veut que les Relations (Gravité) créent du Mouvement :
+        # On projette la Matrice sur les Positions pour obtenir un Vecteur.
+        # F_vec = Relations * (Pos_j - Pos_i) ... (Calcul simplifié ici pour l'exemple)
+        # Pour l'instant, on renvoie les deux séparés pour que le code Legacy
+        # puisse prendre juste 'acc_relations' et ne pas crasher.
+
+        return acc_relations, acc_movement
+    
+    def compute_all_forces_pre(self, vectors, positions, masses, velocities, mask=None):
+        # 1. Calcul des poids finaux (Profil de base + Layers)
+        final = self.base_weights.copy()
+        for layer in self.layers.values():
+            for k, v in layer.items(): 
+                final[k] = max(0.0, final.get(k, 0) + v)
+        
+        # 2. INITIALISATION STRICTE [N, N]
+        # On n'utilise pas 'None' pour éviter les erreurs si aucune loi n'est active.
+        # On n'utilise pas 'zeros_like(positions)' car c'est [N, D] (Mouvement).
+        # On veut une Matrice [N, N] pour le Parsing Legacy.
+        n = vectors.shape[0]
+        total_force = torch.zeros((n, n), device=vectors.device, dtype=vectors.dtype)
+        
+        for name, law in self.laws.items():
+            w = final.get(name, 0.0)
+            if w > 1e-4:
+                # Calcul de la force brute par la loi
+                # Pour Gravity_Legacy, cela renvoie bien [N, N]
+                current_force = law.compute_forces(vectors, positions, masses, velocities, mask, w)
+                
+                # 3. SÉCURITÉ DIMENSIONNELLE
+                # On n'accumule QUE si la loi renvoie le bon format [N, N].
+                # Cela filtre automatiquement les lois "modernes" qui renverraient des vecteurs [N, D].
+                if current_force.shape == total_force.shape:
+                    total_force += current_force * w
+                    
+        return total_force
+    
+    
+    
+    def compute_all_forces_pre(self, vectors, positions, masses, velocities, mask= None):
+        final = self.base_weights.copy()
+        # Fusion des layers (Profils émergents)
+        for layer in self.layers.values():
+            for k, v in layer.items(): 
+                final[k] = max(0.0, final.get(k, 0) + v)
+        
+        #total_force = torch.zeros_like(positions)
+        total_force = None
+        for name, law in self.laws.items():
+            w = final.get(name, 0.0)
+            if w > 1e-4:
+                if total_force is None:
+                    total_force = law.compute_forces(vectors, positions, masses, velocities, mask, w) * w
+                else:
+                    total_force += law.compute_forces(vectors, positions, masses, velocities, mask, w) * w
+        return total_force
+        
+        
+    def compute_all_forces_new(self, vectors, positions, masses, velocities, mask= None):
+        final = self.base_weights.copy()
+        # Fusion des layers (Profils émergents)
+        for layer in self.layers.values():
+            for k, v in layer.items(): 
+                final[k] = max(0.0, final.get(k, 0) + v)
+        
+        total_force = torch.zeros_like(positions)
+        for name, law in self.laws.items():
+            w = final.get(name, 0.0)
+            if w > 1e-4:
+                # Appel de ta fonction Legacy (elle renvoie [N, N])
+                raw_output = law.compute_forces(vectors, positions, masses, velocities, mask, w)
+                
+                # --- ADAPTATEUR INTELLIGENT ---
+                
+                # CAS 1 : La loi est moderne et renvoie déjà des vecteurs [N, 128]
+                if raw_output.shape == total_force.shape:
+                    total_force += raw_output * w
+                    
+                # CAS 2 : La loi est LEGACY (Scalaire [N, N]) -> On projette !
+                elif raw_output.dim() == 2 and raw_output.shape[0] == raw_output.shape[1]:
+                    # On a l'intensité (F), il manque la direction.
+                    # Astuce Barycentrique pour éviter O(N^2 * D) en mémoire :
+                    # Force_i = sum_j ( F_ij * (pos_j - pos_i) / dist_ij )
+                    # On pose Coeff_ij = F_ij / dist_ij
+                    
+                    # 1. On recalcule vite fait les distances (très rapide avec cdist)
+                    # en float 32 pour les CPU car non suporter en float16 pour CPU
+                    if positions.device.type == 'cpu' and positions.dtype == torch.float16:
+                         calc_pos = positions.float()
+                    else:
+                         calc_pos = positions
+                    
+                    
+                    
+                    dists = torch.cdist(calc_pos, calc_pos, p=2) + 1e-6
+                    
+                    # 2. On calcule le coefficient de pondération
+                    # raw_output est ton 'forces' (numérateur / dist)
+                    # On re-divise par dist pour normaliser le vecteur direction
+                    coeffs = raw_output / dists
+                    
+                    # 3. Projection Vectorielle (Matricielle Optimisée)
+                    # Terme Attractif : Vers où je suis tiré (Weighted Center of Mass)
+                    # [N, N] x [N, 128] -> [N, 128]
+                    
+                    pull = torch.mm(coeffs, calc_pos)
+                    
+                    # Terme Répulsif/Inertiel : Ma propre position pondérée
+                    # [N, 1] * [N, 128] -> [N, 128]
+                    push = calc_pos * coeffs.sum(dim=1, keepdim=True)
+                    
+                    # Résultante Vectorielle
+                    force_vector = (pull - push)
+                    
+                    total_force += force_vector * w
+        return total_force
+
+
+# ==============================================================================
+#  MODULE: DYNAMIC TOOLS (The "Operators" reborn)
+# ==============================================================================
+# ==============================================================================
+#  [NOUVEAU] MODULE: DYNAMIC TOOLS (Radar/Filter/Pipeline)
+# ==============================================================================
+class SemanticDevice:
+    def __init__(self, name, type="GENERIC"):
+        self.name = name; self.type = type; self.active = True
+    def process(self, brain, vectors, positions, context): pass
+
+class RadarTool(SemanticDevice):
+    def __init__(self): super().__init__("STD_RADAR", "SENSOR")
+    def scan(self, current_idx, data, direction="FUTURE", k=3):
+        key = 'top_future_ind' if direction == "FUTURE" else 'top_past_ind'
+        return data[key][current_idx, :k]
+
+class FilterTool(SemanticDevice):
+    def __init__(self, force_th, mass_th):
+        super().__init__("STD_FILTER", "SELECTOR")
+        self.force_th = force_th; self.mass_th = mass_th
+    def select(self, current_idx, candidates, data):
+        masked_forces = data['masked_forces']; mass_slice = data['mass_slice']
+        for c_idx in candidates:
+            c_idx = c_idx.item()
+            if masked_forces[current_idx, c_idx].item() <= self.force_th: continue
+            if mass_slice[c_idx].item() <= self.mass_th: continue
+            return c_idx
+        return -1
+
+class ConjugatorTool(SemanticDevice):
+    def __init__(self): super().__init__("STD_BINDER", "ACTUATOR")
+    def execute(self, brain, op, subj_name, targ_name, context, idx_op, target_layer=0):
+        # On utilise le layer transmis par le pipeline (Réalité ou Concept)
+        node_s = brain.ensure_node_in_layer(subj_name, target_layer)
+        node_t = brain.ensure_node_in_layer(targ_name, target_layer)
+        
+        # L'opérateur s'exécute dans ce layer contextuel
+        op.execute(brain, node_s, node_t, layer_type=target_layer)
+        
+        context.add_layer(f"BIND_{idx_op}", {"STRONG": 5.0})
+
+class GrammarPipeline(SemanticDevice):
+    def __init__(self, force_th, mass_th):
+        super().__init__("SVO_PIPELINE", "COMPOSITE")
+        self.radar = RadarTool(); self.filter = FilterTool(force_th, mass_th)
+        self.conjugator = ConjugatorTool()
+
+    def process(self, brain, vectors, positions, context):
+        if not hasattr(brain, 'latest_diagnostic_data'): return
+        data = brain.latest_diagnostic_data
+        active_indices = data.get('active_indices', [])
+        ops = data.get('ops', []); current_words = data['words']; op_dirs = data.get('op_dirs', [])
+
+        # [NOUVEAU] On récupère le buffer des layers
+        # Si absent (vieux code), on fallback sur 0 (Concept)
+        layers = data.get('layers', None)
+
+
+        for i in active_indices:
+            op = ops[i]
+            if not op: continue
+            cands_fut = self.radar.scan(i, data, "FUTURE")
+            cands_past = self.radar.scan(i, data, "PAST")
+            targ_idx = self.filter.select(i, cands_fut, data)
+            subj_idx = self.filter.select(i, cands_past, data)
+
+            if subj_idx != -1 and targ_idx != -1:
+                subj_name = current_words[subj_idx]; targ_name = current_words[targ_idx]
+                
+                # Détermination du Layer Cible
+                # La règle : Le résultat de l'action hérite du layer du SUJET
+                target_layer = 0 # Default Concept
+                if layers is not None:
+                    # .item() car c'est un tenseur
+                    target_layer = layers[subj_idx].item()
+                
+                if op_dirs[i] == "><":
+                    subj_name, targ_name = targ_name, subj_name
+                    # Si on inverse (Passif), on prend le layer de la cible originale qui devient sujet
+                    if layers is not None: target_layer = layers[targ_idx].item()
+                self.conjugator.execute(brain, op, subj_name, targ_name, context, i, target_layer)
+
+# ==============================================================================
+#  INTEGRATION DANS LE MOTEUR
+# ==============================================================================
+
 
 
 # ==============================================================================
@@ -566,9 +1273,16 @@ def gravity_kernel_masked_symmetric(positions: torch.Tensor,
     # Empêche les valeurs > 1.0 ou < -1.0 qui font exploser le .pow(3)
     sim_safe = torch.clamp(sim_matrix, CFG.FORCE_CLAMP_MIN, CFG.FORCE_CLAMP_MAX)
     
-    # 4. Calcul de la Gravité Sémantique
-    dist_matrix = torch.abs(positions.unsqueeze(1) - positions.unsqueeze(0)) + CFG.PHYSICS_EPSILON
-    mass_prod = masses.unsqueeze(1) * masses.unsqueeze(0)
+    # 3. Distance Sémantique OPTIMISÉE (Memory Safe) 
+    # Au lieu de calculer le tenseur de différence [N, N, D] (qui pèse 64Go pour N=2000),
+    # on utilise cdist qui calcule directement la matrice [N, N] (16Mo pour N=2000).
+    # p=2 correspond à la distance Euclidienne (Norme L2).
+    dist_matrix = torch.cdist(positions, positions, p=2) + CFG.PHYSICS_EPSILON
+    
+    # 4. Calcul de la Gravité
+    # Masses est [N] ou [N, 1]. On veut [N, N].
+    if masses.dim() == 2: masses = masses.squeeze(1) # Sécurité
+    mass_prod = masses.unsqueeze(1) * masses.unsqueeze(0) # [N, N]
     
     # (Sim + 1)^3 permet de favoriser fortement les concepts proches
     numerator = mass_prod * (sim_safe + 1.0).pow(CFG.SIMILARITY_POWER)
@@ -589,13 +1303,24 @@ def driver_cpu_numba_LEGACY(positions, masses, vecs, dim, n, mask):
     
     for i in prange(n):
         for j in range(i + 1, n): 
-            # 1. Calcul Physique Inconditionnel (Pipeline Stable)
-            # On ne fait AUCUN 'if' ici pour ne pas briser la vectorisation (SIMD)
+            # Calcul combiné Similarité ET Distance dans la même boucle (Optimisation Cache)
             sim = 0.0
-            for k in range(dim): 
-                sim += vecs[i, k] * vecs[j, k]
+            dist_sq = 0.0
             
-            dist = abs(positions[i] - positions[j]) + 0.1
+            for k in range(dim): 
+                # Produit scalaire
+                sim += vecs[i, k] * vecs[j, k]
+                
+                # CORRECTION : Distance Euclidienne (Vectorielle)
+                # Au lieu de abs(p1-p2) qui ne marche que pour des scalaires,
+                # on fait la somme des carrés des différences.
+                d = positions[i, k] - positions[j, k]
+                dist_sq += d * d
+            
+            # Racine carrée pour avoir la vraie distance
+            dist = np.sqrt(dist_sq) + 0.1
+            
+            # Formule de Gravité Sémantique
             f = (masses[i] * masses[j] * ((sim + 1.0)**3)) / dist
             
             # 2. Application du Masque par Multiplication (ALU vs Branching)
@@ -612,161 +1337,255 @@ def driver_cpu_numba_LEGACY(positions, masses, vecs, dim, n, mask):
 # --- MOTEUR PHYSIQUE ---
 # --- MOTEUR CORRIGÉ ---
 class ChunkedGravityEngine:
-    def __init__(self, dim, max_capacity=128):
+    def __init__(self, dim, physicProfileName=CFG.DEFAULT_FIELD):
         self.dim = dim
-        self.max_capacity = max_capacity
+        # Gestion intelligente de la dimension spatiale
+        # Si non fournie, on utilise la dim par défaut (pour compatibilité)
+        # Mais dans ton cas, ce sera 128.
+        self.spatial_dim = CFG.SPATIAL_DIM
         self.mode = "CPU"
-        kernel_fn = gravity_kernel_masked_symmetric 
-        
-        if TORCH_COMPILE_AVAILABLE:
-            try:
-                self.optimized_kernel = torch.compile(kernel_fn, mode="reduce-overhead")
-            except Exception:
-                self.optimized_kernel = kernel_fn
-        else:
-            self.optimized_kernel = kernel_fn 
-
         self.compute_stream = None
-        if CFG.USE_CUDA:
-            self.compute_stream = torch.cuda.Stream()
-
-        self.cuda_graph = None
-        self.static_input_pos = None
-        self.static_input_mass = None
-        self.static_input_vecs = None
-        self.static_input_mask = None 
-        self.static_output_forces = None
+        self.optimized_kernel = UniversalPhysicsContext(name=physicProfileName) 
+        win = CFG.CUDA_GRAPH_WINDOW_SIZE
+        self.window_size = win
+        self.update_window(win)
+        self.init_data = False
         
-        if CFG.USE_CUDA:
-            if CFG.ENABLE_CUDA_GRAPHS:
-                try:
-                    self.static_input_pos = torch.zeros(max_capacity, device=CFG.DEVICE)
-                    self.static_input_mass = torch.zeros(max_capacity, device=CFG.DEVICE)
-                    self.static_input_vecs = torch.zeros((max_capacity, dim), device=CFG.DEVICE)
-                    self.static_input_mask = torch.ones((max_capacity, max_capacity), device=CFG.DEVICE)
-                    self.static_output_forces = torch.zeros((max_capacity, max_capacity), device=CFG.DEVICE)
-                    self._capture_graph()
-                    self.mode = "HYBRID_AUTO"
-                except Exception: self.mode = "GPU_STD"
-            else: self.mode = "GPU_STD"
-        else: self.mode = "CPU"
+    def UpdateUniversalPhysicsContext(self,name):
+        self.optimized_kernel.set_profile(name)
 
-    def _capture_graph(self):
-        self.optimized_kernel(self.static_input_pos, self.static_input_mass, self.static_input_vecs, self.static_input_mask)
-        torch.cuda.synchronize()
+    def update_window(self, new_window_size=None):
+        """
+        Prépare ou redimensionne uniquement les buffers internes du CUDA Graph.
+        N'affecte pas le stockage des données du monde.
+        """
+        if new_window_size:
+            self.window_size = new_window_size
+            
+        win = self.window_size
+
+        print(f" [ENGINE] Initialisation Compute Engine | Graph Window={win}")
+
+        
+        # 4. CAPTURE DU GRAPH
+        self.mode = "CPU"
+        if CFG.USE_CUDA and CFG.ENABLE_CUDA_GRAPHS:
+            if self.compute_stream is None:
+                self.compute_stream = torch.cuda.Stream()
+            
+            # 2. NETTOYAGE
+            self.graph_pos = None; self.graph_mass = None; self.graph_vecs = None
+            self.graph_vels = None; self.graph_mask = None;
+            self.cuda_graph = None
+            # 3. ALLOCATION DU "CAMION BENNE" (Taille Fixe = Window)
+            dtype = CFG.COMPUTE_DTYPE
+            device = CFG.DEVICE
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+            self.graph_pos = torch.zeros((win, self.spatial_dim), dtype=dtype, device=device)
+            self.graph_mass = torch.zeros(win, dtype=dtype, device=device)
+            self.graph_vecs = torch.zeros((win, self.dim), dtype=dtype, device=device)
+            self.graph_vels = torch.zeros((win, self.spatial_dim), dtype=dtype, device=device)
+            self.graph_mask = torch.zeros((win, win), device=device)
+            
+            
+            # CANAL A : Relations (Matrice [Win, Win])
+            # C'est ici que le Parseur lira "Qui aime Qui".
+            # Attention : Ça consomme (Win * Win) en mémoire, mais c'est nécessaire.
+            self.captured_relations = torch.zeros((win, win), dtype=dtype, device=device)
+
+            # CANAL B : Mouvement (Vecteur [Win, Spatial_Dim])
+            # C'est ici que Euler lira "Qui va où".
+            self.captured_movement = torch.zeros((win, self.spatial_dim), dtype=dtype, device=device)
+            
+            
+            self._capture_graph_windowed() 
+            self.mode = "HYBRID_AUTO"
+        elif CFG.USE_CUDA:
+            self.mode = "GPU_STD"
+
+    def _capture_graph_windowed(self):
+        # On capture l'exécution sur les PETITS buffers (graph_*)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3): # Warmup
+                self.optimized_kernel.compute_all_forces(
+                    self.graph_vecs, self.graph_pos, self.graph_mass, 
+                    self.graph_vels, self.graph_mask)
+        torch.cuda.current_stream().wait_stream(s)
+        
+        # Capture réelle
         self.cuda_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.cuda_graph):
-            self.static_output_forces = self.optimized_kernel(
-                self.static_input_pos, self.static_input_mass, self.static_input_vecs, self.static_input_mask
-            )
+             self.captured_relations, self.captured_movement = self.optimized_kernel.compute_all_forces(
+                self.graph_vecs, self.graph_pos, self.graph_mass, 
+                self.graph_vels, self.graph_mask)
 
-    def compute(self, pos, mass, vecs, n_active, mask=None):
+
+    def compute(self, pos, mass, vecs, n_active, velocities=None, mask=None):
         if self.compute_stream is not None:
             with torch.cuda.stream(self.compute_stream):
-                return self._compute_internal(pos, mass, vecs, n_active, mask)
+                return self._compute_internal(pos, mass, vecs, n_active, velocities, mask)
         else:
-            return self._compute_internal(pos, mass, vecs, n_active, mask)
+            return self._compute_internal(pos, mass, vecs, n_active, velocities, mask)
 
-    def _compute_internal_legacy(self, pos, mass, vecs, n_active, mask=None):
-        if self.mode == "CPU":
-            p_cpu = pos.cpu().numpy(); m_cpu = mass.cpu().numpy(); v_cpu = vecs.cpu().numpy()
-            
-            # Gestion robuste du masque pour Numba
-            # Si pas de masque, on envoie un tableau vide (0,0) qui déclenchera has_mask=False
-            if mask is not None:
-                mask_cpu = mask.cpu().numpy()
-            else:
-                mask_cpu = np.zeros((0, 0), dtype=np.float32)
-                
-            f_cpu = driver_cpu_numba(p_cpu, m_cpu, v_cpu, self.dim, n_active, mask_cpu)
-            return torch.from_numpy(f_cpu).to(CFG.DEVICE)
-
-        if n_active <= self.max_capacity and self.mode == "HYBRID_AUTO":
-            self.static_input_pos[:n_active].copy_(pos)
-            self.static_input_mass[:n_active].copy_(mass)
-            self.static_input_vecs[:n_active].copy_(vecs)
-            if mask is not None:
-                self.static_input_mask[:n_active, :n_active].copy_(mask)
-            else:
-                # IMPORTANT: En mode Graph, si pas de masque, on remplit de 1.0
-                # car le kernel GPU fait une multiplication matricielle stricte.
-                self.static_input_mask[:n_active, :n_active].fill_(1.0)
-            self.cuda_graph.replay()
-            return self.static_output_forces[:n_active, :n_active]
-
-        if n_active <= 5000:
-            return self.optimized_kernel(pos, mass, vecs, mask)
-
-        return self._compute_chunked_sparse_offload(pos, mass, vecs, n_active)
+    
+    def _compute_internal(self, pos, mass, vecs, n_active, velocities=None, mask=None):
+        # 1. INITIALISATION DUAL CHANNEL
         
-    def _compute_internal(self, pos, mass, vecs, n_active, mask=None):
-        # MODE CPU : On utilise maintenant PyTorch (AVX2/MKL) au lieu de Numba
-        # C'est ce qui assure la compatibilité et la stabilité numérique
-        if self.mode == "CPU":
-            # Appel direct au kernel PyTorch unifié (Rapide & Stable)
-            return self.optimized_kernel(pos, mass, vecs, mask)
-
-        # ... (Le reste de la fonction pour le mode GPU/Hybrid reste inchangé) ...
-        if n_active <= self.max_capacity and self.mode == "HYBRID_AUTO":
-            self.static_input_pos[:n_active].copy_(pos)
-            self.static_input_mass[:n_active].copy_(mass)
-            self.static_input_vecs[:n_active].copy_(vecs)
-            if mask is not None:
-                self.static_input_mask[:n_active, :n_active].copy_(mask)
-            else:
-                self.static_input_mask[:n_active, :n_active].fill_(1.0)
-            self.cuda_graph.replay()
-            return self.static_output_forces[:n_active, :n_active]
-
-        if n_active <= 5000:
-            return self.optimized_kernel(pos, mass, vecs, mask)
-
-        return self._compute_chunked_sparse_offload(pos, mass, vecs, n_active)
-
-    def _compute_chunked_sparse_offload(self, pos, mass, vecs, n):
-        chunk_size = CFG.PHYSICS_CHUNK_SIZE
-        cpu_indices = []; cpu_values = []
-        torch.cuda.empty_cache()
+        # Canal A : Relations (Pour le Parseur) - Matrice [N, N]
+        total_relations = torch.zeros((n_active, n_active), device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
         
-        for i in range(0, n, chunk_size):
-            end_i = min(i + chunk_size, n)
-            vecs_i = vecs[i:end_i]; pos_i = pos[i:end_i]; mass_i = mass[i:end_i]
+        # Canal B : Mouvement (Pour Euler) - Vecteur [N, 128]
+        total_movement = torch.zeros((n_active, self.spatial_dim), device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
+        
+        # 2. BOUCLE (CHUNKING)
+        win_size = self.window_size
+        num_chunks = (n_active + win_size - 1) // win_size
+
+        for i in range(num_chunks):
+            start = i * win_size
+            end = min(start + win_size, n_active)
+            current_batch_size = end - start
             
-            for j in range(0, n, chunk_size):
-                end_j = min(j + chunk_size, n)
-                vecs_j = vecs[j:end_j]; pos_j = pos[j:end_j]; mass_j = mass[j:end_j]
-                
-                sim_block = torch.mm(vecs_i, vecs_j.t())
-                dist_block = torch.abs(pos_i.unsqueeze(1) - pos_j.unsqueeze(0)) + 0.1
-                force_block = (mass_i.unsqueeze(1) * mass_j.unsqueeze(0)) * (sim_block + 1.0).pow(3)
-                force_block = force_block / dist_block
-                
-                mask_block = force_block > CFG.SPARSE_THRESHOLD
-                if mask_block.any():
-                    local_indices = torch.nonzero(mask_block, as_tuple=False)
-                    vals = force_block[mask_block]
-                    local_indices_cpu = local_indices.cpu()
-                    vals_cpu = vals.cpu()
-                    global_indices = local_indices_cpu.clone()
-                    global_indices[:, 0] += i
-                    global_indices[:, 1] += j
-                    cpu_indices.append(global_indices)
-                    cpu_values.append(vals_cpu)
-                del sim_block, dist_block, force_block, mask_block
-                
-        if not cpu_indices: 
-            return torch.sparse_coo_tensor(torch.zeros((2,0)), torch.zeros(0), (n, n), device=CFG.DEVICE)
+            # --- DÉCISION DU CHEMIN ---
+            use_cuda_graph = (self.mode == "HYBRID_AUTO" and self.cuda_graph is not None)
             
-        all_indices_cpu = torch.cat(cpu_indices, dim=0).t()
-        all_values_cpu = torch.cat(cpu_values, dim=0)
-        try:
-            return torch.sparse_coo_tensor(all_indices_cpu, all_values_cpu, (n, n)).to(CFG.DEVICE)
-        except RuntimeError:
-            print(" [WARN] Sparse Tensor trop gros pour VRAM, maintien sur CPU.")
-            return torch.sparse_coo_tensor(all_indices_cpu, all_values_cpu, (n, n))
+            chunk_forces_relations = None
+            chunk_forces_movement = None
+
             
+            if use_cuda_graph:
+                # === CHEMIN A : CUDA GRAPH ===
+                
+                # A. Remplissage des Inputs (Camion Benne)
+                self.graph_pos[:current_batch_size].copy_(pos[start:end])
+                self.graph_mass[:current_batch_size].copy_(mass[start:end].squeeze())
+                self.graph_vecs[:current_batch_size].copy_(vecs[start:end])
+                
+                if velocities is not None:
+                    self.graph_vels[:current_batch_size].copy_(velocities[start:end])
+                else:
+                    self.graph_vels[:current_batch_size].zero_()
+
+                # B. Gestion Masque
+                if self.graph_mask is not None:
+                    self.graph_mask.fill_(0)
+                    if mask is not None:
+                        # On extrait le sous-masque correspondant au chunk
+                        self.graph_mask[:current_batch_size, :current_batch_size].copy_(mask[start:end, start:end])
+                    else:
+                        self.graph_mask[:current_batch_size, :current_batch_size].fill_(1.0)
+
+                # C. Padding (Nettoyage)
+                if current_batch_size < win_size:
+                    self.graph_pos[current_batch_size:].fill_(100000.0)
+                    self.graph_mass[current_batch_size:].fill_(0)
+                    self.graph_vecs[current_batch_size:].fill_(0)
+                    self.graph_vels[current_batch_size:].fill_(0)
+                    # Le masque est déjà reset à 0 par fill_(0) au dessus
+
+                # D. Exécution
+                self.cuda_graph.replay()
+                # --- DEBUG BLOCK ---
+                #print(f" [DEBUG] captured_movement (Graph Output): {self.captured_movement.shape}")
+                #print(f" [DEBUG] total_movement (Target Buffer): {total_movement.shape}")
+                # -------------------
+                
+                # E. Récupération & Slicing (CRITIQUE !)
+                # On ne prend que la partie utile du buffer de sortie (4096 -> 4)
+                chunk_forces_relations = self.captured_relations[:current_batch_size, :current_batch_size]
+                # 2. Mouvement : DOUBLE SLICING (Lignes ET Colonnes)
+                # [Lignes : Batch (4), Colonnes : Spatial (128)]
+                # C'est ici que tu corriges le [4096, 4096] -> [4, 128]
+                limit_dim = self.spatial_dim  # 128
+                chunk_forces_movement = self.captured_movement[:current_batch_size, :limit_dim]
+
+            else:
+                # === CHEMIN B : DIRECT SLICING ===
+                
+                slice_pos = pos[start:end] 
+                slice_vecs = vecs[start:end]
+                
+                slice_mass = mass[start:end]
+                if slice_mass.dim() > 1: slice_mass = slice_mass.squeeze()
+                
+                if velocities is not None:
+                    slice_vels = velocities[start:end]
+                else:
+                    slice_vels = torch.zeros((current_batch_size, self.spatial_dim), device=pos.device, dtype=pos.dtype)
+
+                slice_mask = None
+                if mask is not None:
+                    slice_mask = mask[start:end, start:end]
+
+                # Appel direct au Kernel Dual Channel
+                chunk_forces_relations, chunk_forces_movement = self.optimized_kernel.compute_all_forces(
+                    slice_vecs, slice_pos, slice_mass, slice_vels, slice_mask
+                )
+                
+                # CORRECTION : Slicing ici aussi si nécessaire
+                if chunk_forces_movement.shape[1] > self.spatial_dim:
+                    chunk_forces_movement = chunk_forces_movement[:, :self.spatial_dim]
+
+            # 3. ASSEMBLAGE DANS LES GLOBAUX
+            
+            # A. Mouvement (Linéaire)
+            # [Batch, 128] -> [Global, 128]
+            if chunk_forces_movement is not None:
+                total_movement[start:end] = chunk_forces_movement
+            
+            # B. Relations (Diagonale par blocs)
+            # [Batch, Batch] -> [Global, Global]
+            if chunk_forces_relations is not None:
+                # real_batch est une sécurité, normalement égal à current_batch_size
+                real_batch = chunk_forces_relations.shape[0]
+                total_relations[start:end, start:end] = chunk_forces_relations[:real_batch, :real_batch]
+
+        if CFG.USE_CUDA:
+            torch.cuda.synchronize()
+            
+            
+        # --- OPTIMISATION OOM (Pour le Test 17) ---
+        # Si la matrice de relations est gigantesque (> 5000^2), 
+        # on la convertit en Sparse COO pour économiser le bus PCIe lors du retour.
+        # Le consommateur devra la densifier si besoin (ce qu'il fait déjà).
+        
+        limit_sparse = 5000
+        if n_active > limit_sparse:
+            total_relations = total_relations.to_sparse()
+
+        # 4. RETOUR DU TUPLE (Mission Accomplie)
+        return total_relations, total_movement
+    
+    
             
 # --- UTILITAIRES ---
+
+
+def print_vram_status(tag=""):
+    if not torch.cuda.is_available():
+        print(f" [{tag}] CPU Only - Pas de VRAM.")
+        return
+    
+    # On récupère les infos
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    allocated = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    
+    # Conversion en Go pour la lisibilité
+    total_gb = total_mem / (1024**3)
+    free_gb = free_mem / (1024**3)
+    used_gb = (total_mem - free_mem) / (1024**3)
+    alloc_gb = allocated / (1024**3)
+    
+    print(f" 🔍 [VRAM - {tag}]")
+    print(f"    Total: {total_gb:.2f} GB | Libre: {free_gb:.2f} GB | Utilisé (Sys+Torch): {used_gb:.2f} GB")
+    print(f"    PyTorch Alloué (Tenseurs): {alloc_gb:.2f} GB | PyTorch Réservé (Cache): {reserved / (1024**3):.2f} GB")
+    print("-" * 40)
+
 class Quantizer:
     @staticmethod
     def to_storage(tensor): return tensor.to(CFG.STORAGE_DTYPE)
@@ -1262,7 +2081,7 @@ class HybridMemoryCluster:
         # --- COLD TIER (Disque) ---
         self.dirty_set = set()
         self.known_keys_on_disk = set()
-        self.table_name = "concepts"
+        self.table_name = CFG.SEMANTIC_STATE_TABLE
         
         self.search_engine = FaissMemoryEngine(dim)
         self.faiss_dirty = False # Le Flag qui évite les recalculs inutiles
@@ -1350,6 +2169,9 @@ class HybridMemoryCluster:
             print(f" [MEMORY] LanceDB Connecté : {CFG.LANCEDB_URI}")
         except Exception as e: print(f" [CRITICAL] DB Error: {e}")
     
+    
+    
+    
     @property
     def db(self):
         """Accesseur pour récupérer le singleton."""
@@ -1364,7 +2186,7 @@ class HybridMemoryCluster:
                 # On ne charge que les métadonnées, pas les vecteurs lourds
                 df = tbl.search().select(["name", "layer"]).to_pandas()
                 if not df.empty:
-                    keys = (df['layer'].astype(str) + "::" + df['name']).tolist()
+                    keys = (HybridMemoryCluster._make_key(df['name'], df['layer'])).tolist()
                     self.known_keys_on_disk = set(keys)
                 print(f" [MEMORY] Inventaire Disque : {len(self.known_keys_on_disk)} concepts connus.")
             except Exception: pass
@@ -1437,6 +2259,29 @@ class HybridMemoryCluster:
             return self._load_single_from_disk(key, name, layer)
             
         return None
+        
+    def get_physical_state(self, name, layer):
+        if self.db is None: return None, None
+        
+        phys_table_name = CFG.PHYSICS_STATE_TABLE
+        
+        # On vérifie simplement l'existence avant d'ouvrir
+        if phys_table_name in self.db.table_names():
+            try:
+                tbl = self.db.open_table(phys_table_name)
+                safe_name = HybridMemoryCluster._make_key(safe_name, layer).replace("'", "''")
+                
+                # Filtre sur Name ET Layer (Clé composite)
+                
+                res = tbl.search().where(f"id = '{safe_name}'").limit(1).to_pandas()
+                
+                if not res.empty and "pos" in res.columns:
+                    row = res.iloc[0]
+                    if row["pos"] is not None:
+                        return row["pos"], row.get("vel", None)
+            except Exception: pass
+            
+        return None, None
 
     def update_batch(self, names, vectors, layers=None):
         batch_size = len(names)
@@ -1553,7 +2398,7 @@ class HybridMemoryCluster:
         vec_np = self.fast_index[idx].detach().cpu().numpy()
         
         # Donnée formatée pour LanceDB
-        data_item = [{"vector": vec_np, "name": name, "layer": str(layer), "id": idx}]
+        data_item = [{"vector": vec_np, "name": name, "layer": str(layer), "id": key}]
         
         
         try:
@@ -1561,8 +2406,8 @@ class HybridMemoryCluster:
             if self.table_name in self.db.table_names():
                 tbl = self.db.open_table(self.table_name)
                 # Stratégie Delete-Insert pour éviter les doublons
-                safe_name = name.replace("'", "''")
-                tbl.delete(f"name = '{safe_name}' AND layer = '{layer}'")
+                safe_name = key.replace("'", "''")
+                tbl.delete(f"id = '{safe_name}'")
                 tbl.add(data_item)
             else:
                 # Si la table n'existe pas encore (Premier Flush) -> On la crée
@@ -1582,7 +2427,7 @@ class HybridMemoryCluster:
         
     def ensure_loaded_batch(self, names, layer=0):
         """Prefetch groupé depuis le disque."""
-        missing = [n for n in names if self._make_key(n, layer) not in self.name_to_idx and self._make_key(n, layer) in self.known_keys_on_disk]
+        missing = [self._make_key(n, layer) for n in names if self._make_key(n, layer) not in self.name_to_idx and self._make_key(n, layer) in self.known_keys_on_disk]
         if not missing: return
         
         try:
@@ -1592,7 +2437,7 @@ class HybridMemoryCluster:
                 batch = missing[i:i+CHUNK]
                 safe_names = ", ".join([f"'{n.replace("'", "''")}'" for n in batch])
                 # Requête optimisée
-                df = tbl.search().where(f"name IN ({safe_names}) AND layer = '{layer}'").to_pandas()
+                df = tbl.search().where(f"id IN ({safe_names})").to_pandas()
                 if not df.empty: self._ingest_dataframe(df)
         except Exception: pass
         
@@ -1881,9 +2726,10 @@ class HybridMemoryCluster:
         for key in self.dirty_set:
             if key in self.name_to_idx:
                 idx = self.name_to_idx[key]
+                id_key = key
                 lay, nm = self._parse_key(key)
                 vec = self.fast_index[idx].detach().cpu().numpy()
-                data.append({"vector": vec, "name": nm, "layer": str(lay), "id": idx})
+                data.append({"vector": vec, "name": nm, "layer": str(lay), "id": id_key})
                 keys_done.append(key)
         
         if data:
@@ -1892,11 +2738,11 @@ class HybridMemoryCluster:
                 if self.table_name in self.db.table_names():
                     tbl = self.db.open_table(self.table_name)
                     # Batch Delete
-                    names = df['name'].unique().tolist()
-                    for i in range(0, len(names), 500):
-                        sub = names[i:i+500]
+                    list_key_id = df['id'].unique().tolist()
+                    for i in range(0, len(list_key_id), 500):
+                        sub = list_key_id[i:i+500]
                         safe_sub = ", ".join([f"'{n.replace("'", "''")}'" for n in sub])
-                        tbl.delete(f"name IN ({safe_sub})")
+                        tbl.delete(f"id IN ({safe_sub})")
                     tbl.add(df)
                 else:
                     self.db.create_table(self.table_name, data=df)
@@ -1919,102 +2765,6 @@ class HybridMemoryCluster:
         except Exception: pass
         
         
-        
-    def load_index____legacy(self):
-        meta = SafeFileManager.load_json(os.path.join(CFG.BASE_MEM_DIR, "memory_index.json"))
-        if meta and "mapping" in meta:
-            self.name_to_idx = meta["mapping"].get("name_to_idx", {})
-            self.active_count = meta["mapping"].get("active_count", 0)
-            self.idx_to_name = {v: k for k, v in self.name_to_idx.items()}
-            
-        # Chargement des Scales
-        path_scales = os.path.join(CFG.BASE_MEM_DIR, "memory_scales.safetensors")
-        if os.path.exists(path_scales):
-             scale_dict = SafeFileManager.load_tensors(path_scales)
-             if "memory_scales" in scale_dict:
-                 loaded_scales = scale_dict["memory_scales"].to(CFG.STORAGE_DEVICE)
-                 len_s = min(loaded_scales.shape[0], self.capacity)
-                 self.master_scales[:len_s] = loaded_scales[:len_s]
-                 print(f" [MEMORY] Scales chargés ({len_s} entrées).")
-                 
-                 
-                 
-        # --- FIX ROBUSTESSE ---
-        # On vérifie la connexion avant de charger
-        has_db = self._ensure_connection()
-
-        # --- CHARGEMENT DEPUIS LANCEDB ---
-        if LANCEDB_AVAILABLE and (self.db is not None)and has_db:
-            try:
-                # Vérifie si la table existe
-                if "concepts" in self.db.table_names():
-                    self.table = self.db.open_table("concepts")
-                    print(f" [MEMORY] Chargement depuis LanceDB ({self.table.count_rows()} lignes)...")
-                    
-                    # On charge tout en RAM (Pour l'instant - Étape "Hot Memory")
-                    # LanceDB -> Pandas -> Torch
-                    df = self.table.to_pandas()
-                    
-                    # On s'assure de l'ordre via les IDs
-                    df = df.sort_values("id")
-                    
-                    # Reconstruction des vecteurs
-                    # stack convertit la colonne de listes en matrice numpy
-                    vecs_np = np.stack(df["vector"].values)
-                    vecs_tensor = torch.from_numpy(vecs_np).to(dtype=CFG.COMPUTE_DTYPE) # FP32
-                    
-                    count = len(vecs_tensor)
-                    if count > self.capacity:
-                        self.resize(count + 1000)
-                    
-                    
-                    # --- RECONSTRUCTION DU MAPPING RAM ---
-                    self.name_to_idx = {}
-                    self.idx_to_name = {}
-                    self.active_count = count
-                    
-                    for idx, row in df.iterrows():
-                        internal_id = row['id']
-                        nm = row['name']
-                        # Compatibilité : si 'layer' n'existe pas (v13 DB), on met 0
-                        lay = row['layer'] if 'layer' in row else 0 
-                        
-                        key = self._make_key(nm, lay)
-                        self.name_to_idx[key] = internal_id
-                        self.idx_to_name[internal_id] = key
-                    
-                    # Injection dans Master Storage & Fast Index
-                    # Note : Si on est en INT8, on recompressera à la volée ou on utilisera les scales chargés
-                    
-                    if self.is_quantized:
-                        # On re-quantize depuis les vecteurs propres de la DB pour être sûr
-                        q_vecs, q_scales = SmartQuantizer.quantize(vecs_tensor)
-                        self.master_storage[:count] = q_vecs.to(CFG.STORAGE_DEVICE)
-                        # On préfére les scales calculés ici ou ceux du fichier ?
-                        # Ceux du fichier sont plus stables si on n'a pas tout rechargé. 
-                        # Mais ici on recharge tout. On peut updater.
-                        self.master_scales[:count] = q_scales.to(CFG.STORAGE_DEVICE)
-                    else:
-                        self.master_storage[:count] = vecs_tensor.to(CFG.STORAGE_DEVICE)
-                        
-                    # Fast Index (Toujours FP32/16)
-                    self.fast_index[:count] = vecs_tensor.to(CFG.INDEX_DEVICE, dtype=CFG.INDEX_DTYPE)
-                    
-                    # Reconstruction FAISS
-                    if self.search_engine.use_faiss:
-                        self.search_engine.reset()
-                        self.search_engine.add_vectors(vecs_tensor)
-                        
-                    print(f" [SUCCESS] Index restauré depuis LanceDB.")
-                else:
-                    print(" [MEMORY] Aucune table LanceDB trouvée (Premier lancement ou Reset).")
-                    
-            except Exception as e:
-                print(f" [ERR] Echec chargement LanceDB: {e}")
-                traceback.print_exc()
-        
-        
-        print(f" [MEMORY] Index chargé et restauré ({self.active_count} noeuds).")
         
         
 
@@ -2441,11 +3191,16 @@ class FractalNode(nn.Module):
 
 
     def __init__(self, name, dim, phys, parent=None, nature="Neutre", encoder=None, layer_type=None):
-        super().__init__(); self.name = name; self.dim = dim; self.phys = phys; self.encoder = encoder
+        super().__init__();
+        self._nature_vec = None
+        
+        
+        self.name = name; self.dim = dim; self.phys = phys; self.encoder = encoder
         self.parent = parent; self.children = {}; self.concepts = []; self.states = {}; self.metadata = {}
         self.brain = None
         self.layer_type = layer_type if layer_type is not None else CFG.LAYER_CONCEPT
         self.percepts = [] 
+        
         layer_type_nature = CFG.LAYER_CONCEPT
         if self.encoder: self.brain = self.encoder.brain
         elif self.parent: self.brain = self.parent.brain
@@ -2469,7 +3224,7 @@ class FractalNode(nn.Module):
         self.energy = energy 
         self.mass = self._resolve_mass()
         
-        self._nature_vec = None
+        
         
         # --- FIX RESURRECTION ---
         is_loaded = False
@@ -2490,6 +3245,7 @@ class FractalNode(nn.Module):
         
         #self.sync_to_memory()
         self._load()
+        
 
     @property
     def nature_vec(self):
@@ -2515,6 +3271,31 @@ class FractalNode(nn.Module):
             # On utilise le layer_type du noeud pour la clé composite
             # Cette ligne automatise ce qu'on a oublié de faire manuellement !
             self.brain.memory.update(self.name, vector, layer=self.layer_type)
+            
+    @property
+    def position(self):
+        """Lecture directe depuis le moteur physique (Zéro copie stockée ici)"""
+        if self.brain is None: return None
+        # On retourne une copie CPU pour l'usage Python (affichage, logique)
+        return self.brain.memory_positions[self.uid].cpu()
+
+    @position.setter
+    def position(self, new_val):
+        """Écriture directe dans le moteur physique"""
+        if self.brain is None: return
+        
+        # Conversion et injection
+        if isinstance(new_val, torch.Tensor):
+            val = new_val.to(CFG.DEVICE)
+        else:
+            val = torch.tensor(new_val, device=CFG.DEVICE, dtype=torch.float32)
+            
+        # Mise à jour du Tenseur Maître
+        self.brain.memory_positions[self.uid] = val
+        
+        # On marque l'objet dirty pour la métadonnée, 
+        # mais le vrai check se fera via le Snapshot des tenseurs.
+        self.is_dirty = True
 
     def Update_vect_From_GPU(self, vector):
         self._nature_vec = vector
@@ -2610,9 +3391,18 @@ class FractalNode(nn.Module):
         # On utilise COMPUTE_DTYPE (FP16/32) au lieu de STORAGE_DTYPE
         self.states[d] = v.to(dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         self.mark_dirty()
-    def mark_dirty(self): 
-        if not self.is_dirty: self.is_dirty = True; 
-        if self.parent: self.parent.mark_dirty()
+    def mark_dirty(self, visited=None): 
+        # Protection anti-récursion cyclique
+        if visited is None: visited = set()
+        
+        if self.uid in visited: return # On a déjà traité ce noeud dans cette chaîne
+        visited.add(self.uid)
+        
+        if not self.is_dirty: self.is_dirty = True
+        
+        # Propagation vers le haut (Parents)
+        if self.parent: 
+            self.parent.mark_dirty(visited)
     def get_local(self, d): 
         if d in self.states:
             # Plus besoin de conversion complexe, c'est déjà dans le bon format
@@ -3299,14 +4089,15 @@ class HeavyIngestionWorker(multiprocessing.Process):
                 continue
 
 class SensoryStream:
-    def __init__(self, brain):
+    def __init__(self, brain, physicProfileName=CFG.DEFAULT_FIELD):
         self.brain = brain
-        self.phys_engine = ChunkedGravityEngine(brain.dim, max_capacity=CFG.PHYSICS_STATIC_BUFFER_SIZE)
+        self.phys_engine = ChunkedGravityEngine(brain.dim, physicProfileName=physicProfileName)
         self.sparse_engine = SparseGravityEngine(brain)
         self.MAX_LEN = CFG.MAX_SEQUENCE_LENGTH
         D = brain.dim
         self.vecs_buffer = torch.zeros((self.MAX_LEN, D), dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
-        self.positions_buffer = torch.zeros(self.MAX_LEN, dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
+        self.positions_buffer = torch.zeros((self.MAX_LEN, CFG.SPATIAL_DIM), dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
+        self.velocities_buffer = torch.zeros((self.MAX_LEN, CFG.SPATIAL_DIM), dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         self.masses_buffer = torch.zeros(self.MAX_LEN, dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         self.layer_buffer = torch.zeros(self.MAX_LEN, dtype=torch.long, device=CFG.DEVICE)
         self.word_tokens = [""] * self.MAX_LEN 
@@ -3334,6 +4125,10 @@ class SensoryStream:
             print(f" [STREAM] Mode Pipeline ({self.bridge.name}) Activé.")
         else:
             print(" [WARN] Multithreading désactivé. Le bridge ne démarrera pas.")
+
+    def UpdateUniversalPhysicsContext(self,physicProfileName=CFG.DEFAULT_FIELD):
+        self.phys_engine.UpdateUniversalPhysicsContext(physicProfileName)
+
 
     def stop(self):
         if self.bridge: self.bridge.stop()
@@ -3467,11 +4262,64 @@ class SensoryStream:
         self.active_count = n
         self.vecs_buffer[:n] = vecs
         self.weights_buffer[:n] = weights
-        self.positions_buffer[:n] = torch.arange(n, device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
+        
+		############################
+		########   CCOTEST BEGIN
+		############################
+        # --- CORRECTION CRITIQUE (Fix Parsing) ---
+        # On remet une position linéaire (Sequence Index) pour que la grammaire
+        # comprenne la notion de "proche dans la phrase".
+        # On crée des vecteurs [0,0...], [1,0...], [2,0...] pour être compatible 4096D
+        ### CCOIMPLEMPOS seq_pos = torch.arange(n, device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE).unsqueeze(1)
+        # On remplit le buffer (NxD) avec des zéros, puis on met l'index dans la dim 0
+        ### CCOIMPLEMPOS self.positions_buffer[:n].fill_(0.0) 
+        ### CCOIMPLEMPOS self.positions_buffer[:n, 0:1] = seq_pos
+        # -----------------------------------------
+		############################
+		########   CCOTEST END
+		############################
+        
+        # CORRECTION : La position initiale est le vecteur sémantique lui-même
+        # self.positions_buffer[:n] = vecs #=====> CCOTEST a voir si impact
         # Mise à jour des tokens pour la logique sémantique
         # (Attention: ceci est lent en Python pur, point d'opti futur)
         for i, w in enumerate(words):
              if i < self.MAX_LEN: self.word_tokens[i] = w
+
+        # 3. REHYDRATATION PHYSIQUE (Le chaînon manquant)
+        # On va chercher où sont ces concepts MAINTENANT dans le cerveau
+        
+        # A. On prépare les vecteurs par défaut (Projection Sémantique)
+        # Si le concept est nouveau, Position = Sens, Vitesse = 0
+        self.positions_buffer[:n] = vecs[:, :CFG.SPATIAL_DIM] # Default: Projection
+        self.velocities_buffer[:n].zero_() # Default: Immobile
+        
+        # B. On écrase avec la réalité (Mémoire Hot)
+        # Note : On pourrait vectoriser ça avec une map "Word -> UID" optimisée,
+        # mais pour l'instant la boucle est sûre et rapide pour N=128.
+        
+        # On récupère le layer cible actuel (contexte)
+        target_layer = self.layer_type if hasattr(self, 'layer_type') else CFG.LAYER_CONCEPT
+        
+        for i, word in enumerate(words):
+            if i >= n: break
+            
+            # On cherche si le noeud existe DÉJÀ
+            node = self.brain.find_node_in_layer(word, target_layer)
+            
+            if node:
+                uid = node.uid
+                # Lecture directe dans les tenseurs globaux du cerveau
+                # C'est ici qu'on récupère la continuité du mouvement !
+                self.positions_buffer[i] = self.brain.memory_positions[uid]
+                self.velocities_buffer[i] = self.brain.memory_velocities[uid]
+                
+                # Mise à jour du buffer de layer pour les masques
+                self.layer_buffer[i] = node.layer_type
+            else:
+                # Nouveau noeud (sera créé dans _process_buffer_vectorized ou via ensure)
+                self.layer_buffer[i] = target_layer
+
 
         # Mise à jour mémoire (Learning)
         self.brain.memory.update_batch(words, vecs)
@@ -3518,7 +4366,7 @@ class SensoryStream:
             self.active_count = n_words
             self.vecs_buffer[:n_words] = vecs.to(dtype=CFG.COMPUTE_DTYPE)
             self.weights_buffer[:n_words] = weights.to(dtype=CFG.COMPUTE_DTYPE)
-            self.positions_buffer[:n_words] = torch.arange(n_words, device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
+            self.positions_buffer[:n_words] = vecs.to(dtype=CFG.COMPUTE_DTYPE)
             
             # Mise à jour Token Strings
             for i, w in enumerate(tokens): 
@@ -3605,8 +4453,189 @@ class SensoryStream:
         n = self.active_count
         if n < 2: return
         
+        # 1. SLICING PUR (On garde ça car c'est sain pour la propreté du signal)
         vecs_slice = self.vecs_buffer[:n]
         pos_slice = self.positions_buffer[:n]
+        vel_slice = self.velocities_buffer[:n]
+        current_words = self.word_tokens[:n]
+        
+        # --- [PURGE] ON VIRE SPARSE PHYSICS ---
+        # On analyse la phrase brute, sans biais externe.
+        # if CFG.ENABLE_SPARSE_PHYSICS... -> SUPPRIMÉ
+        
+        ops = [None] * n
+        op_dirs = [None] * n
+        
+        # Détermination Layer & Gravité
+        target_layer_base = CFG.DEPTH_CONCEPT
+        if hasattr(self, 'current_context_mode') and self.current_context_mode == "REALITY":
+             target_layer_base = CFG.DEPTH_REALITY
+        
+        if target_layer_base >= CFG.DEPTH_REALITY:
+            gravity_factor = CFG.GRAVITY_MAPPING[CFG.LAYER_REALITY]
+        else:
+            gravity_factor = CFG.GRAVITY_MAPPING.get(target_layer_base, CFG.GRAVITY_MAPPING["DEFAULT"])
+
+        # 2. PRÉPARATION MASSE & OPERATEURS
+        # Calcul vectoriel de base
+        self.masses_buffer[:n] = self.weights_buffer[:n] * gravity_factor
+        effective_trust = getattr(self, 'current_trust_level', 1.0)
+        
+        for i, token in enumerate(current_words):
+            # Population Logique (Création des Nodes si absents)
+            c = self.brain.ensure_node_in_layer(token, target_layer_base)
+            if c:
+                self.layer_buffer[i] = c.layer_type
+                if (hardware := c.get_hardware_function()):
+                    ops[i] = hardware
+                    # L'opérateur écrase la masse sémantique (Priorité absolue)
+                    self.masses_buffer[i] = CFG.MASS_OPERATOR * hardware.priority
+                    op_dirs[i] = c.metadata.get("op_dir", "<>")
+            else:
+                self.layer_buffer[i] = target_layer_base
+
+        mass_slice = self.masses_buffer[:n]
+        
+        # 3. MASQUES & CALCUL PHYSIQUE
+        # On utilise le Top-K Vectorisé pour l'attention physique
+        attention_mask = self._generate_topk_mask_vectorized(vecs_slice, n)
+        
+        # Masque Logique (Règles Layer)
+        layer_mask = self._get_interaction_mask(n, target_layer_base)
+        final_mask = attention_mask * layer_mask
+        
+        if CFG.USE_CUDA: torch.cuda.synchronize()
+        
+        # APPEL ENGINE (Sur les Slices)
+        # Note: raw_force_matrix est [N, N] (Matrice d'énergie)
+        raw_force_matrix, raw_force_mouvement = self.phys_engine.compute(pos_slice, mass_slice, vecs_slice, n, vel_slice, mask=final_mask)
+        
+        if CFG.USE_CUDA: torch.cuda.synchronize()
+        
+        # 4. POST-TRAITEMENT (Legacy Logic)
+        # Gravité Relative
+        raw_force_matrix = raw_force_matrix * gravity_factor
+        if raw_force_matrix.is_sparse: raw_force_matrix = raw_force_matrix.to_dense()
+
+        # LE POINT CRITIQUE : On définit masked_forces
+        # C'est cette matrice qui contient la vérité physique (Masse * Sim * Gravité)
+        masked_forces = raw_force_matrix 
+        
+        # --- [REACTIVATION] INTEGRATION EULER (Mouvement) ---
+        # C'est ici que les concepts bougent physiquement !
+        force_vectors = raw_force_mouvement * gravity_factor
+        
+        
+        dt = 1.0 # Pas de temps
+        FRICTION = 0.90 # Amortissement pour éviter que ça explose (90% de conservation)
+        
+        # 1. Calcul Accélération (a = F / m)
+        # On sécurise la masse pour éviter la division par zéro
+        safe_mass = torch.clamp(mass_slice.unsqueeze(1), min=0.01)
+        acceleration = force_vectors / safe_mass
+        
+        # 2. Mise à jour Vitesse (v = v*friction + a*dt)
+        vel_slice.mul_(FRICTION).add_(acceleration * dt)
+        
+        # 3. Mise à jour Position (p = p + v*dt)
+        pos_slice.add_(vel_slice * dt)
+        
+        # 4. COMMIT : Enregistrement dans le Cerveau
+        # C'est CRUCIAL. Si on ne fait pas ça, le mouvement reste dans le buffer temporaire
+        # et n'est jamais sauvegardé dans LanceDB ou Safetensors.
+        
+        # On utilise le mapping inverse (word -> uid) stocké dans layer_buffer ou via lookup
+        # Comme 'current_words' est aligné avec 'pos_slice', on peut itérer.
+        # Pour aller VITE, on suppose que les indices du buffer correspondent aux positions chargées.
+        # Mais pour être 100% sûr, on refait un lookup rapide.
+        
+        for i, word in enumerate(current_words):
+            # On récupère le noeud (le buffer layer_buffer contient le bon layer type)
+            layer = self.layer_buffer[i].item()
+            node = self.brain.find_node_in_layer(word, layer)
+            
+            if node:
+                # Écriture dans la mémoire globale (Persistance)
+                self.brain.memory_positions[node.uid] = pos_slice[i]
+                self.brain.memory_velocities[node.uid] = vel_slice[i]
+        
+        # ----------------------------------------------------
+
+        # 5. PARSING LOGIQUE (SVO) - RETOUR À LA LOGIQUE LEGACY
+        base_threshold = 0.001
+        force_threshold = max(base_threshold * gravity_factor, 1e-6)
+        mass_threshold = CFG.MASS_THRESHOLD * gravity_factor
+
+        # Détection des Agents Actifs
+        max_forces = masked_forces.max(dim=1).values
+        is_operator_mask = (mass_slice >= (CFG.MASS_OPERATOR - 1.0))
+        has_strong_interaction = (max_forces > force_threshold)
+        
+        active_agents_mask = is_operator_mask & has_strong_interaction
+        active_indices = torch.nonzero(active_agents_mask, as_tuple=False).squeeze(1).cpu().numpy()
+        
+        if len(active_indices) == 0: return
+
+        indices = torch.arange(n, device=CFG.DEVICE)
+        
+        # --- CORRECTION MAJEURE : On utilise masked_forces (Physique) pour le Top-K ---
+        # C'est ça qui manquait. On ne recalcule pas sim_analysis.
+        # On regarde : "Où la force est-elle la plus forte ?"
+        
+        forces_past = masked_forces * (indices.unsqueeze(1) > indices.unsqueeze(0))   # Influence venant d'avant (j < i)
+        forces_future = masked_forces * (indices.unsqueeze(1) < indices.unsqueeze(0)) # Influence venant d'après (j > i)
+        
+        # On prend les indices des forces MAXIMALES
+        k_val = min(3, n)
+        top_past_ind = torch.topk(forces_past, k=k_val, dim=1).indices.cpu().numpy()
+        top_future_ind = torch.topk(forces_future, k=k_val, dim=1).indices.cpu().numpy()
+        
+        # 6. BOUCLE D'EXECUTION (Le Cerveau)
+        for i in active_indices:
+            op = ops[i]
+            if not op: continue
+            
+            # Recherche Cible (Dans le futur) basé sur la FORCE PHYSIQUE
+            targ_idx = -1
+            for k in range(k_val):
+                c_idx = top_future_ind[i, k]
+                # On vérifie si la force brute dépasse le seuil
+                if masked_forces[i, c_idx].item() > force_threshold:
+                    if mass_slice[c_idx] > mass_threshold:
+                        targ_idx = c_idx; break
+            
+            # Recherche Sujet (Dans le passé) basé sur la FORCE PHYSIQUE
+            subj_idx = -1
+            for k in range(k_val):
+                c_idx = top_past_ind[i, k]
+                if masked_forces[i, c_idx].item() > force_threshold:
+                    if mass_slice[c_idx] > mass_threshold:
+                        subj_idx = c_idx; break
+            
+            if subj_idx != -1 and targ_idx != -1:
+                subj_name = current_words[subj_idx]
+                target_name = current_words[targ_idx]
+                
+                d = op_dirs[i]
+                if d == "><": subj_name, target_name = target_name, subj_name
+                
+                # Execution
+                node_s = self.brain.ensure_node_in_layer(subj_name, target_layer_base)
+                node_t = self.brain.ensure_node_in_layer(target_name, target_layer_base)
+                
+                try:
+                    op.execute(self.brain, node_s, node_t, layer_type=target_layer_base, trust_level=effective_trust)
+                except Exception as e:
+                    print(f" [EXEC ERR] {e}")
+
+
+    def _process_buffer_vectorized_new(self):
+        n = self.active_count
+        if n < 2: return
+        
+        vecs_slice = self.vecs_buffer[:n]
+        pos_slice = self.positions_buffer[:n]
+        vel_slice = self.velocities_buffer[:n]
         current_words = self.word_tokens[:n]
         
         # --- [INTEGRATION SPARSE PHYSICS] ---
@@ -3673,25 +4702,81 @@ class SensoryStream:
         # --- MODIFICATION : ATTENTION SÉLECTIVE (TOP-K) ---
         # Au lieu de : attention_mask = self._generate_attention_mask(n)
         attention_mask = self._generate_topk_mask_vectorized(vecs_slice, n)
+        # Masque B : Qui a le droit d'interagir ? (Règles Layer)
+        # On détermine le layer cible comme avant
+        target_layer_base = CFG.DEPTH_CONCEPT
+        if hasattr(self, 'current_context_mode') and self.current_context_mode == "REALITY":
+             target_layer_base = CFG.DEPTH_REALITY
+             
+        layer_mask = self._get_interaction_mask(n, target_layer_base)
+        # On les fusionne : Physique (TopK) AND Logique (Layer Rules)
+        # Le moteur recevra un seul masque qui contient toutes les contraintes
+        final_mask = attention_mask * layer_mask
+        
         
         if CFG.USE_CUDA: torch.cuda.synchronize()
-        raw_force_matrix = self.phys_engine.compute(pos_slice, mass_slice, vecs_slice, n, mask=attention_mask)
+        raw_force_matrix, raw_force_movement = self.phys_engine.compute(pos_slice, mass_slice, vecs_slice, n, vel_slice, mask=final_mask)
         if CFG.USE_CUDA: torch.cuda.synchronize()
+        
+        # 5. TEST DE VÉRITÉ
+        #print(f"DEBUG: Shape raw_force_matrix = {raw_force_matrix.shape}")
+        #if 'layer_mask' in locals():
+        #     print(f"DEBUG: Shape layer_mask = {layer_mask.shape}")
+        
+        
+        
         # Application de la Gravité Relative (Terre vs Mars)
         # C'est ici que la magie opère : on atténue tout le layer d'un coup.
-        
+        # 4. Application de la Gravité Relative
+        # On récupère le facteur G
+        if target_layer_base >= CFG.DEPTH_REALITY:
+            gravity_factor = CFG.GRAVITY_MAPPING[CFG.LAYER_REALITY]
+        else:
+            gravity_factor = CFG.GRAVITY_MAPPING.get(target_layer_base, CFG.GRAVITY_MAPPING["DEFAULT"])
+            
         raw_force_matrix = raw_force_matrix * gravity_factor
         
         if raw_force_matrix.is_sparse:
-             raw_force_matrix = raw_force_matrix.to_dense() # Si besoin
+             raw_force_matrix = raw_force_matrix.to_dense()
         
- 
-        # 4. Application du Masque Logique (Layer Rules)
-        # C'est ici qu'on applique le filtre "Réalité vs Concept"
-        layer_mask = self._get_interaction_mask(n, target_layer_base)
+        # 5. PAS DE FILTRAGE POST-CALCUL (Suppression de la ligne qui plantait)
+        # masked_forces = raw_force_matrix * layer_mask  <-- SUPPRIMÉ
+        masked_forces = raw_force_matrix
+        #print(f"DEBUG: Shape masked_forces = {masked_forces.shape}")
         
-        # La matrice finale combine physique (gravité) et logique (règles)
-        masked_forces = raw_force_matrix * layer_mask
+        
+        # =================================================================
+        # [NOUVEAU] INTEGRATION DU MOUVEMENT (EULER SEMI-IMPLICITE)
+        # C'est ici qu'on applique les forces pour mettre à jour positions/vitesses
+        # et qu'on renvoie le résultat au Cerveau.
+        # =================================================================
+        
+        dt = 1.0 # Delta Time (1 step)
+        
+        # F = m * a  =>  a = F / m
+        # On évite division par zéro avec clamp
+        safe_mass = torch.clamp(mass_slice.unsqueeze(1), min=0.01)
+        acceleration = masked_forces / safe_mass
+        
+        # Mise à jour Vitesse (v = v + a*dt)
+        # On applique aussi une friction naturelle (0.95) pour éviter l'explosion
+        vel_slice.mul_(0.95).add_(acceleration * dt)
+        
+        # Mise à jour Position (p = p + v*dt)
+        pos_slice.add_(vel_slice * dt)
+        
+        # CRUCIAL : RENVOI VERS LE CERVEAU (Commit)
+        # On doit réécrire les nouvelles valeurs dans la mémoire globale
+        # Sinon le mouvement est perdu au prochain tour !
+        for i, word in enumerate(current_words):
+            node = self.brain.find_node_in_layer(word, self.layer_buffer[i].item())
+            if node:
+                self.brain.memory_positions[node.uid] = pos_slice[i]
+                self.brain.memory_velocities[node.uid] = vel_slice[i]
+        
+        # ================================================================
+        
+        
         
         # 5. Analyse des Forces (Trigger)
         # CORRECTION : Le seuil doit s'adapter à la gravité du Layer.
@@ -3718,11 +4803,42 @@ class SensoryStream:
  
         indices = torch.arange(n, device=CFG.DEVICE)
         # SVO : Sujet (Passé) < Opérateur (Présent) < Cible (Futur)
-        forces_past = masked_forces * (indices.unsqueeze(1) > indices.unsqueeze(0))
-        forces_future = masked_forces * (indices.unsqueeze(1) < indices.unsqueeze(0))
+        # 1. On recrée les Matrices d'Influence [N, N]
+        # 1. Calcul rapide de l'intensité relationnelle [N, N]
+        # (On normalise pour avoir une valeur propre entre 0 et 1)
+        v_norm = F.normalize(vecs_slice, p=2, dim=1)
+        sim_analysis = torch.mm(v_norm, v_norm.t()) # Matrice [4, 4]
+
+        # 2. Définition des Masques Temporels [N, N]
+        mask_past = (indices.unsqueeze(1) > indices.unsqueeze(0))   # Influence venant d'avant
+        mask_future = (indices.unsqueeze(1) < indices.unsqueeze(0)) # Influence venant d'après
         
-        top_future_ind = torch.topk(forces_future, k=min(3, n), dim=1).indices.cpu().numpy()
-        top_past_ind = torch.topk(forces_past, k=min(3, n), dim=1).indices.cpu().numpy()
+        # 3. Calcul des Totaux (Scalaires)
+        # On remplace l'ancienne logique vectorielle par une somme d'intensité sémantique.
+        # Les variables 'total_past' et 'total_future' existent et sont valides pour la suite.
+        total_past = (sim_analysis * mask_past).sum(dim=1)
+        total_future = (sim_analysis * mask_future).sum(dim=1)
+        
+        # (On supprime les lignes forces_past = ... qui causaient le crash)
+        # =================================================================
+
+        # Le reste de ton code original fonctionne maintenant car total_past existe !
+        limit_force = 0.1 # Seuil arbitraire (ajuste si besoin)
+        
+        
+        # Ce sont les "cartes" des interactions temporelles
+        matrix_past = sim_analysis * mask_past
+        matrix_future = sim_analysis * mask_future
+        
+        # 2. Calcul des Top-K (Qui m'a le plus influencé ?)
+        # On cherche les indices des noeuds avec la plus forte intensité
+        # C'est exactement l'équivalent de tes anciennes lignes, mais sur la matrice stable.
+        
+        # Protection contre n < k (si on a moins de 3 mots)
+        k_val = min(3, n)
+        
+        top_past_ind = torch.topk(matrix_past, k=k_val, dim=1).indices.cpu().numpy()
+        top_future_ind = torch.topk(matrix_future, k=k_val, dim=1).indices.cpu().numpy()
         
         for i in active_indices:
             op = ops[i]
@@ -3768,7 +4884,9 @@ class SensoryStream:
                     
                     op.execute(self.brain, node_s, node_t, layer_type=target_layer_base,
                                trust_level=effective_trust)
-                except Exception as e: print(f" [EXEC ERR] {e}")
+                except Exception as e:
+                    print(f" [EXEC ERR] {e} {op}")
+                    traceback.print_exc()
 
 class UnifiedBrain:
     def __init__(self, str_lang, boolResetBase=False, ram_limit=None):
@@ -3779,6 +4897,8 @@ class UnifiedBrain:
             
         self.ram_limit = ram_limit
         self.dim = CFG.DIM_SIZE; self.temperature = 1.0
+        # On utilise la dimension spatiale configurée (ex: 128)
+        self.spatial_dim = getattr(CFG, "SPATIAL_DIM", 128) # Sécurité si pas dans config
         self.encoder = MatrixEncoder(self.dim, self).to(CFG.DEVICE) 
         self.phys = HyperPhysics(self.dim).to(CFG.DEVICE)
         self.memory = HybridMemoryCluster(self.dim, max_nodes=CFG.INITIAL_MAX_NODES, ram_limit=self.ram_limit)
@@ -3802,6 +4922,24 @@ class UnifiedBrain:
         self.fast_lookup = {}   # (NomExact, Layer) -> UID (Unique)
         self.fuzzy_lookup = {}  # (NomLower, Layer) -> [UID1, UID2...] (Liste)
         self.global_energies = torch.zeros(self.max_nodes, dtype=torch.float32).to(CFG.DEVICE)
+        
+        
+        # --- MODIFICATION V1.0 PHYSIQUE ---
+        self.memory_positions = torch.zeros((self.max_nodes, self.spatial_dim), device=CFG.DEVICE)
+        # [NOUVEAU] Stockage Vitesse (V1.0)
+        self.memory_velocities = torch.zeros((self.max_nodes, self.spatial_dim), device=CFG.DEVICE)
+        # [NOUVEAU] SNAPSHOT DE REFERENCE (Pour le Dirty Check)
+        # Stocke la position telle qu'elle était au dernier chargement disque.
+        self.snapshot_positions = torch.zeros((self.max_nodes, self.spatial_dim), device=CFG.DEVICE)
+        
+        
+        # [NOUVEAU] Initialisation Physique & Outils
+        self.physics_context = UniversalPhysicsContext()
+        self.grammar_pipeline = GrammarPipeline(force_th=CFG.MASS_THRESHOLD, mass_th=CFG.MASS_THRESHOLD)
+        self.tools = [self.grammar_pipeline]
+        # -----------------------------------
+        
+        
         
         self.root = FractalNode("GENESIS", self.dim, self.phys, encoder=self.encoder)
         self.mental = FractalNode("MENTAL", self.dim, self.phys, encoder=self.encoder, parent=self.root)
@@ -3850,12 +4988,18 @@ class UnifiedBrain:
         self.bootstrap(objLang)
     
     def register_node(self, node):
-        if self.free_ids:
-            uid = self.free_ids.pop(); self.global_energies[uid] = 0.0
+        # --- SECURITE IDEMPOTENCE (Ta correction) ---
+        # Si le noeud a déjà une carte d'identité valide, on ne lui en donne pas une autre.
+        # Cela empêche de "brûler" des IDs si on appelle register() deux fois sur le même objet.
+        if hasattr(node, 'uid') and node.uid is not None and node.uid >= 0:
+            uid = node.uid
         else:
-            uid = self.next_node_id
-            if uid >= self.max_nodes: self.expand_memory()
-            self.next_node_id += 1
+            if self.free_ids:
+                uid = self.free_ids.pop(); self.global_energies[uid] = 0.0
+            else:
+                uid = self.next_node_id
+                if uid >= self.max_nodes: self.expand_memory()
+                self.next_node_id += 1
         
         # CORRECTION : On injecte l'UID dans le node IMMÉDIATEMENT
         # Cela permet à register_node_lookup de lire node.uid juste après
@@ -3865,6 +5009,37 @@ class UnifiedBrain:
         
         # Enregistrement centralisé du lookup (maintenant node.uid existe)
         self.register_node_lookup(node)
+        
+        # --- AJOUT : INITIALISATION PHYSIQUE (Projection) ---
+        # On projette le sens (Nature) vers l'espace (Position) pour éviter le (0,0,0)
+        # Cela donne une "place naturelle" au concept dès sa naissance.
+        
+        
+        if node.nature_vec is not None:
+            # Sécurité Device
+            vec = node.nature_vec.to(CFG.DEVICE)
+            
+            # CORRECTION : Slicing Sémantique (4096) -> Physique (128)
+            # On coupe le vecteur pour qu'il rentre dans l'espace physique
+            if vec.shape[0] >= self.spatial_dim:
+                initial_pos = vec[:self.spatial_dim]
+            else:
+                # Si le vecteur est trop petit (très rare), on pad avec des zéros
+                initial_pos = torch.zeros(self.spatial_dim, device=CFG.DEVICE)
+                initial_pos[:vec.shape[0]] = vec
+            
+            
+            # A. Écriture dans la mémoire vive (Hot)
+            self.memory_positions[uid] = initial_pos
+            
+            # B. Écriture dans le Snapshot (Référence)
+            # C'est CRUCIAL : Si on ne le fait pas, le prochain 'sleep' croira que le noeud 
+            # a bougé de (0,0,0) à (Pos) et déclenchera une écriture disque inutile.
+            self.snapshot_positions[uid] = initial_pos
+            
+            # Note: La vélocité reste à 0 (Naît immobile), c'est ce qu'on veut.
+        # ----------------------------------------------------
+        
         
         return uid
 
@@ -3927,12 +5102,61 @@ class UnifiedBrain:
             self.memory.resize(new_max)
             # Vérification critique : est-ce que la mémoire a VRAIMENT grandi ?
             if self.memory.capacity == new_max:
+                device = CFG.DEVICE
+                dtype = CFG.COMPUTE_DTYPE
+            
                 new_energies = torch.zeros(new_max, dtype=torch.float32).to(CFG.DEVICE)
                 # Copie sécurisée
                 current_len = len(self.global_energies)
                 new_energies[:current_len] = self.global_energies
                 self.global_energies = new_energies
+                
+                # --- AJOUT : Resize Positions & Vélocités ---
+                # On crée les nouveaux tenseurs plus grands
+                new_pos = torch.zeros((new_max, CFG.SPATIAL_DIM), dtype=dtype, device=CFG.DEVICE)
+                new_vel = torch.zeros((new_max, CFG.SPATIAL_DIM), dtype=dtype, device=CFG.DEVICE)
+                
+                # On copie les anciennes données (Migration)
+                # On utilise min() pour éviter les erreurs d'index si incohérence
+                safe_len = min(current_len, new_max)
+                
+                new_pos[:safe_len] = self.memory_positions[:safe_len]
+                new_vel[:safe_len] = self.memory_velocities[:safe_len]
+                
+                # On remplace les pointeurs
+                self.memory_positions = new_pos
+                self.memory_velocities = new_vel
+                
+                # --- AJOUT : Resize du Snapshot ---
+                new_snap = torch.zeros((new_max, CFG.SPATIAL_DIM), dtype=dtype, device=CFG.DEVICE)
+                
+                # On copie l'ancien snapshot
+                current_len = len(self.snapshot_positions)
+                new_snap[:current_len] = self.snapshot_positions
+                
+                # On remplace
+                self.snapshot_positions = new_snap
+                # --------------------------------------------
+                
+                
                 self.max_nodes = new_max
+                
+                # IMPORTANT : Il faut aussi prévenir le moteur physique !
+                # Le moteur a sa propre copie (self.stream.phys_engine.velocities)
+                # On force une synchro au prochain step via le mécanisme existant ou manuellement :
+                # =================================================================
+                # CORRECTION : RECRÉATION DU MOTEUR (Au lieu de sync_velocity)
+                # =================================================================
+                
+                
+                print(f" [SUCCESS] Mémoire étendue à {new_max} slots.")
+                # ================================================================
+                # On peut aussi copier directement pour être sûr :
+                #self.stream.phys_engine.velocities = new_vel.clone() # Clone pour découpler
+                #self.stream.phys_engine.update_capacity(new_max, preserve_data=True)
+                #self.stream.phys_engine.max_capacity = new_max # Mettre à jour la capacité du moteur
+                
+                
                 print(f" [SUCCESS] Extension réussie.")
             else:
                 print(" [CRITICAL] La mémoire n'a pas pu être redimensionnée (OOM probable).")
@@ -3948,7 +5172,6 @@ class UnifiedBrain:
     def delete_node(self, node):
         if node.uid in self.node_registry:
             layer = node.layer_type
-            
             if layer is not None:
                 # 1. Nettoyage Index Exact
                 key_exact = (node.name.strip(), layer)
@@ -3961,7 +5184,6 @@ class UnifiedBrain:
                     # On retire uniquement l'UID concerné
                     if node.uid in self.fuzzy_lookup[key_fuzzy]:
                         self.fuzzy_lookup[key_fuzzy].remove(node.uid)
-                    
                     # Si la liste est vide, on nettoie la clé
                     if not self.fuzzy_lookup[key_fuzzy]:
                         del self.fuzzy_lookup[key_fuzzy]
@@ -4102,6 +5324,38 @@ class UnifiedBrain:
             self.register_node_lookup(new_node)
         
             new_node.sync_to_memory()
+        
+        # ==============================================================================
+        # [AJOUT CRITIQUE] RESTAURATION DE LA POSITION PHYSIQUE (LAZY LOAD PHYSIQUE)
+        # ==============================================================================
+        # À ce stade, 'new_node' a une position par défaut (issue de register_node).
+        # On vérifie si LanceDB a une meilleure information (Historique).
+        
+        db_pos, db_vel = self.memory.get_physical_state(name, layer_type)
+        
+        if db_pos is not None:
+            # SUCCÈS : On a retrouvé une position historique !
+            # On écrase la projection par défaut.
+            
+            uid = new_node.uid
+            
+            # Conversion List -> Tensor
+            t_pos = torch.tensor(db_pos, device=CFG.DEVICE, dtype=torch.float32)
+            self.memory_positions[uid] = t_pos
+            
+            # On met à jour le Snapshot pour ne pas déclencher une sauvegarde immédiate
+            # (Puisqu'on vient de charger depuis le disque, c'est "propre")
+            self.snapshot_positions[uid] = t_pos
+            
+            if db_vel is not None:
+                t_vel = torch.tensor(db_vel, device=CFG.DEVICE, dtype=torch.float32)
+                self.memory_velocities[uid] = t_vel
+                
+            # print(f" [IO] Restauration physique DB pour '{name}'") # (Optionnel, verbeux)
+            
+        # Sinon : On garde la projection sémantique calculée par register_node.
+        # ==============================================================================
+        
         
         return new_node
 
@@ -4323,7 +5577,16 @@ class UnifiedBrain:
             active_nodes.append(self.node_registry[uid])
             
         new_count = len(active_nodes)
-        if new_count == 0: return
+        if new_count == 0: 
+            print(" [WARN] Mémoire vide, reset complet.")
+            self.next_node_id = 0
+            self.node_registry = {}
+            self.memory.reset() 
+            # Reset des tenseurs physiques
+            self.memory_positions.zero_()
+            self.memory_velocities.zero_()
+            self.snapshot_positions.zero_()
+            return
 
         print(f" [OPTIMIZATION] {new_count} noeuds actifs identifiés. Reconstruction...")
 
@@ -4340,6 +5603,15 @@ class UnifiedBrain:
         vectors_to_keep = []
         names_to_keep = []
         
+        # --- AJOUT ---
+        velocities_to_keep = [] # Buffer temporaire
+        # -------------
+        # --- AJOUT ---
+        positions_to_keep = [] 
+        # -------------
+        snapshot_to_keep = [] 
+        
+        
         # 3. MIGRATION (Phase Critique)
         for new_uid, node in enumerate(active_nodes):
             # --- ETAPE A : Lecture de l'ancien état (Avant modif UID) ---
@@ -4347,6 +5619,14 @@ class UnifiedBrain:
             
             # Sauvegarde de l'énergie (car global_energies est indexé par old_uid)
             current_energy = self.global_energies[old_uid]
+            
+            # --- AJOUT : Capture de la vitesse ---
+            velocities_to_keep.append(self.memory_velocities[old_uid])
+            # -------------------------------------
+            # --- AJOUT : Capture Position ---
+            positions_to_keep.append(self.memory_positions[old_uid])
+            # --------------------------------
+            snapshot_to_keep.append(self.snapshot_positions[node.uid])
             
             # --- FIX OPTIMISATION LAZY & ROBUSTESSE ---
             # 1. Tentative de récupération intelligente (RAM -> Disque)
@@ -4400,6 +5680,54 @@ class UnifiedBrain:
         self.global_energies = new_energies
         self.next_node_id = new_count
         self.max_nodes = new_capacity
+        
+        
+        
+        # 6. RECONSTRUCTION DES TENSEURS PHYSIQUES
+        # C'est l'étape cruciale : on recrée les tenseurs propres et contigus.
+        
+        new_capacity = self.max_nodes # On garde la capacité max allouée
+        dim_spatial = self.memory_positions.shape[1] # On récupère la dimension (ex: 128)
+        
+        # --- A. RECONSTRUCTION POSITIONS ---
+        if positions_to_keep:
+            # Stack transforme la liste de tenseurs en un seul tenseur [N_active, Dim]
+            active_tensor_pos = torch.stack(positions_to_keep)
+            
+            # On crée le nouveau conteneur propre (rempli de zéros)
+            new_mem_pos = torch.zeros((new_capacity, dim_spatial), device=CFG.DEVICE)
+            
+            # On copie les données actives au début
+            new_mem_pos[:len(active_tensor_pos)] = active_tensor_pos
+            
+            # On remplace le pointeur du cerveau
+            self.memory_positions = new_mem_pos
+
+        # --- B. RECONSTRUCTION VELOCITES ---
+        if velocities_to_keep:
+            active_tensor_vel = torch.stack(velocities_to_keep)
+            new_mem_vel = torch.zeros((new_capacity, dim_spatial), device=CFG.DEVICE)
+            new_mem_vel[:len(active_tensor_vel)] = active_tensor_vel
+            self.memory_velocities = new_mem_vel
+            
+        # --- C. RECONSTRUCTION SNAPSHOT (Ce qui manquait) ---
+        if snapshot_to_keep:
+            active_tensor_snap = torch.stack(snapshot_to_keep)
+            new_mem_snap = torch.zeros((new_capacity, dim_spatial), device=CFG.DEVICE)
+            new_mem_snap[:len(active_tensor_snap)] = active_tensor_snap
+            self.snapshot_positions = new_mem_snap
+        
+        # 7. SYNCHRONISATION MOTEUR PHYSIQUE
+        # Le moteur doit pointer vers les nouvelles adresses mémoire
+        # Important : on clone pour éviter les effets de bord si le moteur modifie in-place avant le prochain step
+        #self.stream.phys_engine.velocities = self.memory_velocities.clone()
+        # Si le moteur a besoin de positions internes (selon ton implémentation engine)
+        # self.stream.phys_engine.positions = self.memory_positions.clone() 
+        
+        # On informe le moteur de la nouvelle taille active (optionnel mais propre)
+        self.stream.phys_engine.current_N = self.next_node_id
+        
+        
         self.free_ids = set() # Le système est maintenant parfaitement contigu, plus de trous.
         
         # Remplacement mémoire
@@ -4454,6 +5782,18 @@ class UnifiedBrain:
             new_energies = torch.zeros(saved_max_nodes, dtype=torch.float32).to(CFG.DEVICE)
             # Pas besoin de copier les anciennes énergies (elles sont vides au boot)
             self.global_energies = new_energies
+            
+            # Allocation Positions & Vélocités (NOUVEAU)
+            print(f"[MAXNODE] saved_max_nodes {saved_max_nodes}")
+            print(f"[MAXNODE] CFG.SPATIAL_DIM {CFG.SPATIAL_DIM}")
+            self.memory_positions = torch.zeros((saved_max_nodes, CFG.SPATIAL_DIM), device=CFG.DEVICE)
+            self.memory_velocities = torch.zeros((saved_max_nodes, CFG.SPATIAL_DIM), device=CFG.DEVICE)
+            self.snapshot_positions = torch.zeros((saved_max_nodes, CFG.SPATIAL_DIM), device=CFG.DEVICE)
+            
+            #self.memory_positions = torch.zeros((saved_max_nodes, self.dim), device=CFG.DEVICE)
+            #self.memory_velocities = torch.zeros((saved_max_nodes, self.dim), device=CFG.DEVICE)
+            #self.snapshot_positions = torch.zeros((saved_max_nodes, self.dim), device=CFG.DEVICE)
+            
             self.max_nodes = saved_max_nodes
             
             
@@ -4510,7 +5850,7 @@ class UnifiedBrain:
                 # --- FIX RESTAURATION MONOLITHIQUE ---
                 if d == "__NATURE__":
                     # On restaure le vecteur dans l'objet Node
-                    path_to_obj[p].nature_vec = v.to(CFG.DEVICE)
+                    path_to_obj[p].nature_vec = v.to(device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
                     # Note: On ne force pas self.memory.update ici pour laisser 
                     # la priorité à LanceDB (chargé dans __init__).
                     # Ce fichier sert de filet de sécurité structurel.
@@ -4518,6 +5858,165 @@ class UnifiedBrain:
                 else:
                     path_to_obj[p].set(d, v)
 
+        
+        # ==============================================================================
+        # GESTION ROBUSTE DES POSITIONS (Strategie : Projection -> LanceDB -> Safetensor)
+        # ==============================================================================
+        
+        # 1. INITIALISATION PAR DÉFAUT : PROJECTION SÉMANTIQUE (Le Filet de Sécurité)
+        # On le fait en PREMIER. Comme ça, tout nœud qui ne sera pas trouvé plus tard
+        # aura au moins une position physique cohérente dérivée de son sens.
+        print(" [BOOT] Init Positions : Projection Sémantique (Baseline).")
+        active_n = self.memory.active_count
+        safe_n = min(active_n, self.max_nodes)
+        
+        if safe_n > 0:
+            # Slicing intelligent : on prend les N premières dims du vecteur sémantique
+            # On s'assure d'être sur le bon device pour la copie
+            semantics = self.memory.fast_index[:safe_n].to(CFG.DEVICE)
+            self.memory_positions[:safe_n] = semantics[:, :CFG.SPATIAL_DIM]
+            # On initialise aussi le snapshot pour éviter de marquer tout "dirty" au premier save
+            self.snapshot_positions[:safe_n] = self.memory_positions[:safe_n]
+
+        # ------------------------------------------------------------------------------
+
+        # 2. TENTATIVE CHARGEMENT : CACHE CHAUD (Safetensors)
+        # C'est la source la plus rapide et la plus précise (état exact avant shutdown)
+        path_pos = os.path.join(CFG.BASE_MEM_DIR, "genesis_positions.safetensors")
+        loaded_from_safetensor = False
+
+        if os.path.exists(path_pos):
+            try:
+                data = SafeFileManager.load_tensors(path_pos)
+                if "positions" in data:
+                    loaded = data["positions"].to(CFG.DEVICE)
+                    n_load = min(len(loaded), self.max_nodes)
+                    self.memory_positions[:n_load] = loaded[:n_load]
+                    
+                    # --- CORRECTION CRITIQUE ---
+                    # B. Mise à jour de la référence (Snapshot)
+                    # Puisque c'est l'état sauvegardé, c'est notre "Zéro" pour le calcul de mouvement.
+                    self.snapshot_positions[:n_load] = self.memory_positions[:n_load]
+                    # ---------------------------
+                    
+                    
+                    print(f" [BOOT] Positions restaurées depuis Safetensors ({n_load}).")
+                    loaded_from_safetensor = True
+            except Exception as e:
+                print(f" [ERR] Safetensor corrompu, fallback activé: {e}")
+
+        # ------------------------------------------------------------------------------
+
+        # 3. TENTATIVE CHARGEMENT : COLD STORAGE (LanceDB - Streaming)
+        # Uniquement si pas de Safetensor. On lit la DB par flux pour ne pas exploser la RAM.
+        if not loaded_from_safetensor and hasattr(self.memory, 'db') and self.memory.db is not None:
+            print(" [BOOT] Pas de Cache Chaud. Lecture Streaming LanceDB (Recovery)...")
+            try:
+                tbl_name = getattr(self.memory, "table_name", CFG.PHYSICS_STATE_TABLE)
+                if tbl_name in self.memory.db.table_names():
+                    tbl = self.memory.db.open_table(tbl_name)
+                    
+                    # STREAMING : On utilise to_batches() qui renvoie un itérateur PyArrow
+                    # Cela ne charge qu'un petit morceau à la fois en RAM.
+                    # On ne demande QUE les colonnes utiles (id, pos, vel).
+                    batch_iter = tbl.search().select(["id", "pos", "vel"]).to_batches()
+                    
+                    count_db_restored = 0
+                    
+                    for batch in batch_iter:
+                        # Conversion légère Batch -> Python List (pour itération rapide)
+                        # Note: Si on voulait être encore plus rapide, on resterait en Arrow/Numpy
+                        # mais il faut mapper les IDs vers les index mémoire.
+                        ids = batch["id"].to_pylist()
+                        positions = batch["pos"].to_pylist()
+                        velocities = batch["vel"].to_pylist()
+                        
+                        for ids_list, pos_list, vel_list in zip(ids, positions, velocities):
+                            # Vérification : Est-ce un noeud valide et chargé ?
+                            # Et est-ce que la position existe en base ?
+                            if ids_list in semantic_map and pos_list is not None:
+                                idx = self.name_to_idx[key]
+                                # On écrase la projection sémantique par la vérité historique
+                                t_pos = torch.tensor(pos_list, device=CFG.DEVICE, dtype=torch.float32)
+                                t_vel = torch.tensor(vel_list, device=CFG.DEVICE, dtype=torch.float32)
+                                self.memory_positions[idx] = t_pos
+                                self.memory_velocities[idx] = t_vel
+                                count_db_restored += 1
+                                
+                    print(f" [BOOT] Restauration partielle depuis LanceDB : {count_db_restored} noeuds.")
+                    
+                    # Mise à jour du Snapshot post-recovery
+                    self.snapshot_positions.copy_(self.memory_positions)
+                    
+            except Exception as e:
+                print(f" [WARN] Echec lecture LanceDB (On garde la projection sémantique) : {e}")
+        
+        # --- RESTAURATION VELOCITES (Avec le Else implicite) ---
+        path_vel = os.path.join(CFG.BASE_MEM_DIR, "genesis_velocities.safetensors")
+        if os.path.exists(path_vel):
+            vel_data = SafeFileManager.load_tensors(path_vel)
+            if "velocities" in vel_data:
+                loaded_vel = vel_data["velocities"].to(CFG.DEVICE)
+                current_len = min(len(loaded_vel), self.max_nodes)
+                self.memory_velocities[:current_len] = loaded_vel[:current_len]
+                print(f" [BOOT] Vélocités restaurées ({current_len}).")
+        else:
+            # LE ELSE IMPLICITE :
+            # Si le fichier n'existe pas, self.memory_velocities contient déjà des zéros
+            # (car initialisé avec torch.zeros plus haut ou dans __init__).
+            # C'est parfait : pas de mouvement, mais pas de crash de taille.
+            print(" [BOOT] Pas de fichier vélocité. Démarrage à l'arrêt (V=0).")
+        
+        
+        # C. CREATION DU SNAPSHOT (La Référence T=0)
+        # On copie l'état actuel pour dire "C'est notre point de départ propre"
+        self.snapshot_positions.copy_(self.memory_positions)
+        
+        
+        # 3. Synchronisation Moteur Physique (CRITIQUE)
+        # On injecte le tableau (qu'il soit restauré ou vide) dans le moteur
+        #self.stream.phys_engine.velocities = self.memory_velocities.clone()
+        # On s'assure que le moteur connaît la nouvelle taille max
+        #self.stream.phys_engine.update_capacity(self.max_nodes, preserve_data=True)
+        #self.stream.phys_engine.max_capacity = self.max_nodes
+        
+        # --- AJOUT : RESTAURATION POSITIONS ---
+        path_pos = os.path.join(CFG.BASE_MEM_DIR, "genesis_positions.safetensors")
+        
+        if os.path.exists(path_pos):
+            # CAS A : On a une sauvegarde précise
+            pos_data = SafeFileManager.load_tensors(path_pos)
+            if "positions" in pos_data:
+                loaded_pos = pos_data["positions"].to(CFG.DEVICE)
+                current_len = min(len(loaded_pos), self.max_nodes)
+                self.memory_positions[:current_len] = loaded_pos[:current_len]
+                print(f" [BOOT] Positions restaurées ({current_len}).")
+        else:
+            # CAS B : Pas de fichier (Migration ou Reset)
+            # On initialise la position sur le sens (Vecteur Sémantique)
+            # C'est vital pour que les nœuds ne soient pas tous à (0,0,0)
+            print(" [BOOT] Init Positions depuis la Mémoire Sémantique (Fallback).")
+            
+            # On copie depuis le Fast Index (la mémoire vive des vecteurs)
+            active_count = self.memory.active_count
+            safe_count = min(active_count, self.max_nodes)
+            
+            if safe_count > 0:
+                # Copie brute : Position = Sens
+                #self.memory_positions[:safe_count] = self.memory.fast_index[:safe_count].to(CFG.DEVICE)
+                # ==================================================================
+                # CORRECTION DU FALLBACK : SLICING 4096 -> 128
+                # ==================================================================
+                # On récupère les vecteurs sémantiques (4096 dims)
+                semantics = self.memory.fast_index[:safe_count].to(CFG.DEVICE)
+                
+                # On ne prend QUE les N premières dimensions (128) pour la position
+                # C'est l'opérateur [:, :128] qui fait la découpe.
+                self.memory_positions[:safe_count] = semantics[:, :CFG.SPATIAL_DIM]
+                # ==================================================================
+        # --------------------------------------
+        
+        
         # 8. Restauration Historique
         h_states = SafeFileManager.load_tensors(os.path.join(CFG.BASE_MEM_DIR, "genesis_history.safetensors"))
         for k, v in h_states.items():
@@ -4782,14 +6281,21 @@ class UnifiedBrain:
                 if thought:
                     print(f"   ~ (Rêve) Genesis pense : '{thought}'"); self.perceive(thought); count += 1
 
-    def sleep(self):
-        self.metabolism.run_cycle(); self.consolidate_hypotheses(); self.dream_cycle()
-        print(" [SOMMEIL] Update Centroïdes & Entropie...")
-        self.root.update_centroid()
-        print(f" [METABOLISME] Decay Global Vectorisé sur {self.next_node_id} noeuds.")
-        if self.next_node_id > 0: self.global_energies[:self.next_node_id] *= 0.9
-        dead_nodes = self.root.apply_decay()
-        if dead_nodes: print(f" [ENTROPY] {len(dead_nodes)} noeuds oubliés ce cycle.")
+    def sleep(self, nap=False):
+    
+        # --- BLOC A : BIOLOGIE DESTRUCTIVE (On ne fait ça que si on dort vraiment) ---
+        if not nap:
+            self.metabolism.run_cycle()
+            self.consolidate_hypotheses()
+            self.dream_cycle()
+            print(" [SOMMEIL] Update Centroïdes & Entropie...")
+            self.root.update_centroid()
+            print(f" [METABOLISME] Decay Global Vectorisé sur {self.next_node_id} noeuds.")
+            if self.next_node_id > 0: self.global_energies[:self.next_node_id] *= 0.9
+            dead_nodes = self.root.apply_decay()
+            if dead_nodes: print(f" [ENTROPY] {len(dead_nodes)} noeuds oubliés ce cycle.")
+        else:
+            print(" [BIOLOGIE] Mode Sieste (Nap) : Sauvegarde sans modification structurelle.")
         
         self.memory.save_all()
         self.encoder.save(CFG.BASE_MEM_DIR);
@@ -4806,6 +6312,155 @@ class UnifiedBrain:
         SafeFileManager.save_monolithic_v2(dummy_tensors, structure_data, self.global_energies, CFG.BASE_MEM_DIR, mem_meta)
         history_states = {}; dummy = {}; self._collect_node_data(self.time_root, "ROOT/TEMPS", history_states, dummy)
         SafeFileManager.save_tensors(history_states, os.path.join(CFG.BASE_MEM_DIR, "genesis_history.safetensors"))
+        
+        # 1. RÉCUPÉRATION DES VITESSES DU MOTEUR
+        # Le moteur physique a les vitesses les plus à jour (celles qui viennent de bouger).
+        # On les copie dans le stockage principal du Cerveau.
+        # Attention aux tailles : on prend le minimum des deux.
+        # active_len = min(self.next_node_id, self.stream.phys_engine.max_capacity)
+        
+        # On copie depuis l'engine vers la mémoire persistante
+        #self.memory_velocities[:active_len] = self.stream.phys_engine.velocities[:active_len]
+
+        # 2. SAUVEGARDE SUR DISQUE
+        # On ajoute cette ligne pour créer un fichier "genesis_velocities.safetensors"
+        SafeFileManager.save_tensors(
+            {"velocities": self.memory_velocities}, 
+            os.path.join(CFG.BASE_MEM_DIR, "genesis_velocities.safetensors")
+        )
+        
+        # --- AJOUT : SAUVEGARDE POSITIONS ---
+        SafeFileManager.save_tensors(
+            {"positions": self.memory_positions}, 
+            os.path.join(CFG.BASE_MEM_DIR, "genesis_positions.safetensors")
+        )
+        # ------------------------------------
+        
+        # 3. SAUVEGARDE INTELLIGENTE (LanceDB - Long Terme)
+        # On cherche qui a bougé significativement
+        # Calcul vectoriel rapide GPU : distance(actuel, snapshot)
+        deltas = torch.norm(self.memory_positions - self.snapshot_positions, dim=1)
+        
+        # Masque booléen des nœuds qui ont bougé > SEUIL
+        moved_mask = deltas > CFG.PHYSICS_WRITE_THRESHOLD
+        
+        # On récupère les indices
+        moved_indices = torch.nonzero(moved_mask).squeeze()
+        
+        if moved_indices.numel() > 0:
+            print(f" [IO] Sauvegarde DB Physique : {moved_indices.numel()} nœuds modifiés.")
+            
+            # --- 3. SAUVEGARDE INTELLIGENTE LANCEDB (MANQUANTE) ---
+        print(" [IO] Analyse des mouvements physiques pour LanceDB...")
+        
+        # A. Calcul du Delta (Qui a bougé par rapport au Snapshot ?)
+        # On calcule la distance Euclidienne entre la position actuelle et le snapshot T=0
+        deltas = torch.norm(self.memory_positions - self.snapshot_positions, dim=1)
+        
+        # B. Filtrage (On ne garde que ceux > Seuil)
+        # CFG.PHYSICS_WRITE_THRESHOLD = 0.05
+        moved_indices = torch.nonzero(deltas > CFG.PHYSICS_WRITE_THRESHOLD).squeeze()
+        
+        # Sécurité si un seul item (0-d tensor)
+        if moved_indices.dim() == 0 and moved_indices.numel() == 1:
+            moved_indices = moved_indices.unsqueeze(0)
+
+        count = moved_indices.numel()
+        
+        if count > 0:
+            print(f" [IO] Mise à jour DB Physique : {count} noeuds modifiés.")
+            
+            # Préparation du Batch pour LanceDB
+            updates = []
+            
+            # On passe en CPU pour préparer les données JSON/Arrow
+            # Attention : C'est une boucle Python, pour 10k items ça peut prendre 1-2s.
+            # Optimisation possible : Vectoriser la création de liste si nécessaire.
+            #cpu_pos = self.memory_positions[moved_indices].cpu().numpy()
+            #cpu_vel = self.memory_velocities[moved_indices].cpu().numpy()
+            cpu_idx = moved_indices.cpu().numpy()
+            
+            current_time = time.time()
+            """
+            cpu_pos = self.memory_positions[uid].detach().cpu().numpy()
+            cpu_vel = self.memory_velocities[uid].detach().cpu().numpy()
+            
+            self.fast_index[idx].detach().cpu().numpy()
+            #######################""
+            for key in self.dirty_set:
+            if key in self.name_to_idx:
+                idx = self.name_to_idx[key]
+                lay, nm = self._parse_key(key)
+                vec = self.fast_index[idx].detach().cpu().numpy()
+                data.append({"vector": vec, "name": nm, "layer": str(lay), "id": idx})
+                keys_done.append(key)
+            ##################################
+            for i, uid in enumerate(cpu_idx):
+            # On récupère le nom depuis le registre pour le debug (optionnel)
+            node = self.node_registry.get(int(uid))
+            if node:
+                updates.append({
+                    "id": int(uid),
+                    "name": node.name,           # Lisibilité
+                    "layer": str(node.layer_type), # Clé composite (avec name)
+                    "pos": cpu_pos[i].tolist(), # LanceDB veut des listes, pas des numpy arrays
+                    "vel": cpu_vel[i].tolist(),
+                    "last_updated": current_time
+                    # Note: LanceDB 'merge' met à jour les champs fournis et garde les autres
+                })
+            """
+            
+            for i, uid in enumerate(cpu_idx):
+                # On récupère le nom depuis le registre pour le debug (optionnel)
+                node = self.node_registry.get(int(uid))
+                if node:
+                    updates.append({
+                        "id": HybridMemoryCluster._make_key(node.name, node.layer_type),
+                        "name": node.name,           # Lisibilité
+                        "layer": str(node.layer_type), # Clé composite (avec name)
+                        "pos": self.memory_positions[uid].detach().cpu().numpy(), # LanceDB veut des listes, pas des numpy arrays
+                        "vel": self.memory_velocities[uid].detach().cpu().numpy(),
+                        "last_updated": current_time
+                        # Note: LanceDB 'merge' met à jour les champs fournis et garde les autres
+                    })
+            
+            if updates:
+                try:
+                    hys_tbl_name = CFG.PHYSICS_STATE_TABLE
+                    
+                    df_phys = pd.DataFrame(updates)
+                    phys_tbl_name = CFG.PHYSICS_STATE_TABLE
+                    #print(f"[recordDB] {phys_tbl_name} table exist {phys_tbl_name in self.memory.db.table_names()}")
+                    #print(f"[recordDB] list table {self.memory.db.table_names()}")
+                    if phys_tbl_name in self.memory.db.table_names():
+                        tbl = self.memory.db.open_table(phys_tbl_name)
+                        # --- UPSERT MANUEL (Delete + Add) ---
+                        # 1. Récupération des IDs
+                        # Batch Delete
+                        list_key_id = df_phys['id'].tolist()
+                        if list_key_id:
+                            for i in range(0, len(list_key_id), 500):
+                                sub = list_key_id[i:i+500]
+                                safe_sub = ", ".join([f"'{n.replace("'", "''")}'" for n in sub])
+                                tbl.delete(f"id IN ({safe_sub})")
+                            tbl.add(df_phys)
+                        
+                        # 4. Insertion
+                        tbl.add(df_phys)
+                        # ------------------------------------
+                        
+                    else:
+                        print(f" [MEMORY] Création Lazy de la table '{phys_tbl_name}'...")
+                        self.memory.db.create_table(phys_tbl_name, data=df_phys)
+                        #print(df_phys)
+                    
+                    print(f" [SUCCESS] Table '{phys_tbl_name}' synchronisée ({len(df_phys)} entrées).")
+                    
+                    # Update Snapshot
+                    self.snapshot_positions[moved_indices] = self.memory_positions[moved_indices]
+                    
+                except Exception as e:
+                    print(f" [ERR] Echec update table physique : {e}")
     
     def life_cycle(self):
         print("\n [LIFE] Démarrage de la Boucle de Vie (Non-Bloquante)...")
@@ -4979,6 +6634,7 @@ class GenesisDiagnostic:
         self.test_lancedb_startup_load()
         self.test_lazy_memory_performance()
         self.test_sparse_physics_logic()
+        self.test_persistence_integrity()
         print("\n=== Fin Diagnostic ===")
     
     def forensic_audit_ghosts(self):
@@ -5009,8 +6665,8 @@ class GenesisDiagnostic:
         # [MODIFICATION] Lecture depuis LanceDB au lieu des Shards Safetensors
         if hasattr(self.brain.memory, 'db') and self.brain.memory.db is not None:
             try:
-                if "concepts" in self.brain.memory.db.table_names():
-                    tbl = self.brain.memory.db.open_table("concepts")
+                if CFG.SEMANTIC_STATE_TABLE in self.brain.memory.db.table_names():
+                    tbl = self.brain.memory.db.open_table(CFG.SEMANTIC_STATE_TABLE)
                     # On récupère juste la colonne des noms pour aller vite
                     # to_arrow() est plus léger que to_pandas() pour une seule colonne
                     df_names = tbl.search().limit(1000000).to_pandas()["name"] # Limit large
@@ -5331,6 +6987,7 @@ class GenesisDiagnostic:
         existing_node = self.brain.find_concept_exact("TropPlein")
         if existing_node:
             # On le supprime pour partir d'une base saine
+            print(f'[INFO] NODE "TropPlein" exist node uid: {existing_node.uid}')
             self.brain.delete_node(existing_node)
         
         # On sauvegarde l'état actuel du recyclage pour le restaurer plus tard
@@ -5339,15 +6996,22 @@ class GenesisDiagnostic:
         self.brain.free_ids.clear() 
         
         # --- ÉTAPE 1 : TEST EXPANSION ---
+        initial_node_id = self.brain.next_node_id
         initial_max = self.brain.max_nodes
         print(f" > Max Nodes Initial: {initial_max}")
-        
+        print(f'[INFO]free id list: {self.brain.free_ids}')
+        print(f'[INFO] PRE MODIF, Initial max: {self.brain.max_nodes}')
+        print(f'[INFO] PRE MODIF, next_node_id: {self.brain.next_node_id}')
         # On force le compteur à la limite pour déclencher l'expansion immédiate
         self.brain.next_node_id = initial_max
-        
+        print(f'[INFO] PRE NODE CREATION, Initial max: {self.brain.max_nodes}')
+        print(f'[INFO] PRE NODE CREATION, next_node_id: {self.brain.next_node_id}')
         print(" > Création concept 'TropPlein' pour forcer l'expansion...")
         # Ici, comme free_ids est vide et next_node_id == max, l'expansion est OBLIGATOIRE
         tp_node = self.brain.ensure_concept("TropPlein")
+        print(f'[INFO] POST NODE CREATION, Initial max: {self.brain.max_nodes}')
+        print(f'[INFO] POST NODE CREATION, next_node_id: {self.brain.next_node_id}')
+        print(f'[INFO] POST NODE CREATION, node uid: {tp_node.uid}')
         
         expected_double = initial_max * 2
         expected_linear = initial_max + CFG.STEP_SCALE_MEM
@@ -5384,6 +7048,7 @@ class GenesisDiagnostic:
             elif rec_node.uid < next_id_marker:
                  # Cas où il a pris un autre ID libre plus bas, mais n'a pas créé de nouvel ID
                 print(f" [SUCCESS] Recyclage partiel : ID {rec_node.uid} utilisé (Pool actif).")
+                self.brain.delete_node(rec_node)
             else:
                 print(f" [FAIL] Pas de recyclage : Nouvel ID généré ({rec_node.uid}).")
                 
@@ -5392,24 +7057,31 @@ class GenesisDiagnostic:
         # Pour faire simple et robuste, on réinjecte ceux qu'on avait backupés
         # Sauf si on veut garder l'état exact, mais pour un test unitaire, le but est de ne pas casser la suite.
         self.brain.free_ids.update(real_free_ids_backup)
+        self.brain.max_nodes = initial_max
+        self.brain.next_node_id = initial_node_id
+        #self.brain.sleep(nap=True)
     
     def test_hybrid_engine(self):
         print("\n--- 17. TEST HYBRID ENGINE (N9: BENCHMARK & SCALING) ---")
         N_small = 2000
-        pos = torch.rand(N_small, device=CFG.DEVICE); mass = torch.ones(N_small, device=CFG.DEVICE)
+        pos = torch.rand(N_small, CFG.SPATIAL_DIM, device=CFG.DEVICE);
+        vel = torch.zeros_like(pos)
+        mass = torch.ones(N_small, device=CFG.DEVICE)
         vecs = torch.randn(N_small, CFG.DIM_SIZE, device=CFG.DEVICE)
         engine = self.brain.stream.phys_engine
-        t0 = time.time(); engine.compute(pos, mass, vecs, N_small);
+        t0 = time.time(); engine.compute(pos, mass, vecs, N_small, vel);
         if CFG.USE_CUDA:
             torch.cuda.synchronize()
         t_small = (time.time() - t0) * 1000
         print(f" > N={N_small} (Mode {engine.mode}) : {t_small:.2f} ms")
         
         N_large = 10000
-        pos = torch.rand(N_large, device=CFG.DEVICE); mass = torch.ones(N_large, device=CFG.DEVICE)
+        pos = torch.rand(N_large, CFG.SPATIAL_DIM, device=CFG.DEVICE);
+        vel = torch.zeros_like(pos)
+        mass = torch.ones(N_large, device=CFG.DEVICE)
         vecs = torch.randn(N_large, CFG.DIM_SIZE, device=CFG.DEVICE)
         t0 = time.time()
-        res = engine.compute(pos, mass, vecs, N_large)
+        res, mov = engine.compute(pos, mass, vecs, N_large, vel)
         if CFG.USE_CUDA:
             torch.cuda.synchronize()
         t_large = (time.time() - t0) * 1000
@@ -5524,10 +7196,13 @@ class GenesisDiagnostic:
         print("\n--- 25. TEST BROADCASTING & GRAPHS (N9) ---")
         N = 100 
         dim = CFG.DIM_SIZE
-        pos = torch.rand(N, device=CFG.DEVICE); mass = torch.ones(N, device=CFG.DEVICE); vecs = torch.randn(N, dim, device=CFG.DEVICE)
+        pos = torch.rand(N, CFG.SPATIAL_DIM, device=CFG.DEVICE)
+        vel = torch.zeros_like(pos)
+        mass = torch.ones(N, device=CFG.DEVICE)
+        vecs = torch.randn(N, dim, device=CFG.DEVICE)
         engine = self.brain.stream.phys_engine
         t0 = time.time()
-        for _ in range(100): engine.compute(pos, mass, vecs, N)
+        for _ in range(100): engine.compute(pos, mass, vecs, N, vel)
         if CFG.USE_CUDA:
             torch.cuda.synchronize()
         t1 = time.time()
@@ -5541,14 +7216,15 @@ class GenesisDiagnostic:
         N_massive = 50000 
         print(f" > Tentative de simulation de {N_massive} particules (Mode Offloading CPU)...")
         try:
-            pos = torch.rand(N_massive, device=CFG.DEVICE)
+            pos = torch.rand(N_massive, CFG.SPATIAL_DIM, device=CFG.DEVICE)
+            vel = torch.zeros_like(pos)
             mass = torch.ones(N_massive, device=CFG.DEVICE)
             vecs_small = torch.randn(1000, CFG.DIM_SIZE, device=CFG.DEVICE)
             vecs = vecs_small.repeat(50, 1)
             
             engine = self.brain.stream.phys_engine
             t0 = time.time()
-            res = engine.compute(pos, mass, vecs, N_massive)
+            res, mov = engine.compute(pos, mass, vecs, N_massive, vel)
             t1 = time.time()
             print(f" [SUCCESS] Calcul réussi en {(t1-t0):.4f} s !")
         except RuntimeError as e:
@@ -5593,7 +7269,8 @@ class GenesisDiagnostic:
     def test_attention_masking(self):
         print("\n--- 29. TEST ATTENTION MASKING (MVP91) ---")
         N = 4
-        pos = torch.rand(N, device=CFG.DEVICE)
+        pos = torch.rand(N, CFG.SPATIAL_DIM,device=CFG.DEVICE)
+        vel = torch.zeros_like(pos)
         mass = torch.ones(N, device=CFG.DEVICE)
         vecs = torch.randn(N, CFG.DIM_SIZE, device=CFG.DEVICE)
         mask = torch.zeros((N, N), device=CFG.DEVICE)
@@ -5606,7 +7283,7 @@ class GenesisDiagnostic:
         # -----------------------------------
         
         engine = self.brain.stream.phys_engine
-        forces = engine.compute(pos, mass, vecs, N, mask=mask)
+        forces, movements = engine.compute(pos, mass, vecs, N, vel, mask=mask)
         
         # On synchronise aussi après pour être sûr de lire le résultat final
         if CFG.USE_CUDA:
@@ -5625,12 +7302,25 @@ class GenesisDiagnostic:
         print(" [SYSTEM] Rechargement du cerveau (Simulation Reset)...")
         del self.brain
         # 2. On vide le cache GPU (Important pour PyTorch)
+        print_vram_status()
         if CFG.USE_CUDA: torch.cuda.empty_cache()
         gc.collect()
         # 4. Petite pause syndicale pour Windows
         # On tente 0.5s (500ms). Si ça plante, mettez 1.0.
         #time.sleep(0.5)
-        if CFG.USE_CUDA: torch.cuda.empty_cache()
+        if CFG.USE_CUDA:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize() # On attend que ce soit bien fini
+        print_vram_status()
+        
+        # 3. CRUCIAL : On vide le cache de PyTorch
+        # C'est la seule commande qui rend réellement la mémoire à la carte graphique
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize() # On attend que ce soit bien fini
+            
+        print(f" [SYSTEME] VRAM libérée. Allocation libre: {torch.cuda.memory_allocated()/1024**2:.2f} MB")
+        print_vram_status()
         new_brain = UnifiedBrain("fr", boolResetBase=False)
         self.brain = new_brain 
         reloaded_mol = self.brain.find_concept_exact(mol_name)
@@ -5759,14 +7449,17 @@ class GenesisDiagnostic:
         print(f" > Configuration: N={N} corps, Dim={dim}, Device=CPU")
         
         # On force les tenseurs sur CPU pour le test
-        pos = torch.rand(N, device="cpu", dtype=torch.float32)
+        pos = torch.rand(N, CFG.SPATIAL_DIM, device="cpu", dtype=torch.float32)
+        vel = torch.zeros_like(pos)
         mass = torch.ones(N, device="cpu", dtype=torch.float32)
         vecs = torch.randn(N, dim, device="cpu", dtype=torch.float32)
         
         # 2. Test PyTorch (Nouveau Kernel Vectorisé AVX)
         print(" > Run PyTorch (Unified Kernel)...")
         start_torch = time.perf_counter()
-        _ = gravity_kernel_masked_symmetric(pos, mass, vecs, mask=None)
+        gravity_kernel_masked_symmetric_force_function = self.brain.stream.phys_engine.optimized_kernel.compute_all_forces
+
+        _ = gravity_kernel_masked_symmetric_force_function(vecs, pos, mass, vel, mask=None)
         end_torch = time.perf_counter()
         dur_torch = (end_torch - start_torch) * 1000
         print(f"   -> Temps PyTorch: {dur_torch:.2f} ms")
@@ -5810,12 +7503,16 @@ class GenesisDiagnostic:
         
         # Vecteurs géants (simule une explosion de gradient ou une accumulation infinie)
         vecs = torch.randn(N, dim, device=CFG.DEVICE) * 100.0 
-        pos = torch.rand(N, device=CFG.DEVICE)
+        pos = torch.rand(N, CFG.SPATIAL_DIM, device=CFG.DEVICE)
+        vel = torch.zeros_like(pos)
         mass = torch.ones(N, device=CFG.DEVICE)
+        
+        
         
         # Le kernel doit tenir le coup grâce à la normalisation interne
         try:
-            forces = gravity_kernel_masked_symmetric(pos, mass, vecs)
+            gravity_kernel_masked_symmetric_force_function = self.brain.stream.phys_engine.optimized_kernel.compute_all_forces
+            forces, movement = gravity_kernel_masked_symmetric_force_function(vecs, pos, mass, vel)
             if torch.isnan(forces).any() or torch.isinf(forces).any():
                 print(" [FAIL] Explosion numérique détectée (NaN ou Inf) !")
             else:
@@ -5834,7 +7531,8 @@ class GenesisDiagnostic:
         
         for n in steps:
             # Création de données dummy
-            pos = torch.rand(n, device=CFG.DEVICE)
+            pos = torch.rand(n, CFG.SPATIAL_DIM, device=CFG.DEVICE)
+            vel = torch.zeros_like(pos)
             mass = torch.ones(n, device=CFG.DEVICE)
             vecs = torch.randn(n, dim, device=CFG.DEVICE)
             
@@ -5843,7 +7541,7 @@ class GenesisDiagnostic:
             t0 = time.perf_counter()
             
             # On appelle le moteur via le stream pour utiliser la logique de chunking si nécessaire
-            _ = self.brain.stream.phys_engine.compute(pos, mass, vecs, n)
+            _, _ = self.brain.stream.phys_engine.compute(pos, mass, vecs, n, vel)
             
             torch.cuda.synchronize() if CFG.USE_CUDA else None
             dt = (time.perf_counter() - t0) * 1000
@@ -6148,7 +7846,7 @@ class GenesisDiagnostic:
         # 5. Vérification Logique
         print(" > Interrogation directe de la base...")
         try:
-            tbl = self.brain.memory.db.open_table("concepts")
+            tbl = self.brain.memory.db.open_table(CFG.SEMANTIC_STATE_TABLE)
             res = tbl.search().where(f"name = '{test_concept}'").limit(1).to_pandas()
             
             if not res.empty:
@@ -6295,6 +7993,118 @@ class GenesisDiagnostic:
              print(" [SUCCESS] Robustesse validée (Pas d'effet sur vecteur nul).")
         else:
              print(" [FAIL] Le moteur a modifié un vecteur nul (Comportement imprévu).")
+             
+             
+    def test_persistence_integrity(self):
+        pass
+        
+        print("\n" + "="*60)
+        print("\n--- 47.  [TEST] INTEGRITE PERSISTANCE (Safetensors + LanceDB)")
+        print("="*60)
+
+        # 1. CRÉATION D'UN CAS DE TEST
+        # On crée un noeud fictif pour le test
+        test_name = "TEST_PHYSICS_PERSISTENCE"
+        # On s'assure qu'il n'existe pas déjà pour ne pas fausser le test
+        node = self.brain.find_node_in_layer(test_name, CFG.LAYER_CONCEPT)
+        #self.brain.node_lookup.get(test_name)
+        if node:
+            uid = node.uid
+            print(f" -> Réutilisation du noeud existant UID {uid}")
+        else:
+            # Création via ensure_concept ou register direct
+            # On simule un vecteur nature aléatoire
+            dummy_vec = torch.randn(self.brain.dim, device=CFG.DEVICE)
+            node = self.brain.ensure_concept(test_name)
+            uid = node.uid
+            #node = FractalNode(test_name, self.brain.dim, self.brain.phys, parent=self.brain.root, layer_type=CFG.LAYER_CONCEPT)
+            #uid = self.brain.register_node(node)
+            print(f" -> Création nouveau noeud UID {uid}")
+
+        # 2. SIMULATION DE MOUVEMENT (Pour déclencher le Dirty Check)
+        print(" -> Injection de valeurs physiques connues...")
+        
+        # Valeurs cibles arbitraires (qu'on veut retrouver sur le disque)
+        # On met des valeurs très reconnaissables (ex: 999.0)
+        target_pos = torch.full((CFG.SPATIAL_DIM,), 999.0, device=CFG.DEVICE)
+        target_vel = torch.full((CFG.SPATIAL_DIM,), -5.0, device=CFG.DEVICE)
+        
+        # A. On modifie la mémoire vive (HOT)
+        self.brain.memory_positions[uid] = target_pos
+        self.brain.memory_velocities[uid] = target_vel
+        
+        # B. CRUCIAL : On s'assure que le Snapshot est DIFFÉRENT
+        # Sinon le 'sleep' va croire que rien n'a bougé et ne pas écrire en DB.
+        # On met le snapshot à 0 pour être sûr que la distance > SEUIL
+        self.brain.snapshot_positions[uid] = torch.zeros(CFG.SPATIAL_DIM, device=CFG.DEVICE)
+        
+        dist = torch.norm(self.brain.memory_positions[uid] - self.brain.snapshot_positions[uid])
+        print(f" -> Delta provoqué : {dist:.4f} (Seuil requis: {CFG.PHYSICS_WRITE_THRESHOLD})")
+        assert dist > CFG.PHYSICS_WRITE_THRESHOLD, "Le delta est trop faible pour déclencher la sauvegarde !"
+
+        # 3. SAUVEGARDE (Appel du Sleep)
+        print(" -> Exécution de sleep() (Sauvegarde)...")
+        self.brain.sleep()
+
+        # 4. VERIFICATION 1 : SAFETENSORS (RAM DUMP)
+        print(" -> Vérification Safetensors (Positions)...")
+        path_pos = os.path.join(CFG.BASE_MEM_DIR, "genesis_positions.safetensors")
+        path_vel = os.path.join(CFG.BASE_MEM_DIR, "genesis_velocities.safetensors")
+        
+        assert os.path.exists(path_pos), "Fichier positions.safetensors manquant !"
+        
+        from safetensors.torch import load_file
+        loaded_pos_tensor = load_file(path_pos)["positions"]
+        loaded_vel_tensor = load_file(path_vel)["velocities"]
+        
+        # On vérifie la valeur à l'index UID (sur CPU pour l'assert)
+        saved_pos = loaded_pos_tensor[uid].to(CFG.DEVICE)
+        saved_vel = loaded_vel_tensor[uid].to(CFG.DEVICE)
+        
+        if torch.allclose(saved_pos, target_pos, atol=1e-4):
+            print("   [OK] Safetensors Position correspond.")
+        else:
+            print(f"   [FAIL] Safetensors Pos: {saved_pos[:3]}... vs Target {target_pos[:3]}...")
+            print("Safetensors Position mismatch")
+
+        if torch.allclose(saved_vel, target_vel, atol=1e-4):
+            print("   [OK] Safetensors Velocité correspond.")
+        else:
+            print("   [FAIL]afetensors Velocity mismatch")
+
+        # 5. VERIFICATION 2 : LANCEDB (COLD STORAGE)
+        print(f" -> Vérification LanceDB (Table: {CFG.PHYSICS_STATE_TABLE})...")
+        
+        db = self.brain.memory.db
+        tbl_name = CFG.PHYSICS_STATE_TABLE
+        
+        assert tbl_name in db.table_names(), f"Table {tbl_name} introuvable dans LanceDB !"
+        
+        tbl = db.open_table(tbl_name)
+        # Requête pour récupérer notre noeud test
+        str_key = HybridMemoryCluster._make_key(node.name, node.layer_type)
+        res = tbl.search().where(f"id = '{str_key}'").limit(1).to_pandas()
+        
+        if res.empty:
+            print(f"[FAIL]Noeud UID {uid} introuvable dans LanceDB !")
+        else:
+            row = res.iloc[0]
+            db_pos = torch.tensor(row["pos"], device=CFG.DEVICE)
+            db_vel = torch.tensor(row["vel"], device=CFG.DEVICE)
+            
+            if torch.allclose(db_pos, target_pos, atol=1e-4):
+                print("   [OK] LanceDB Position correspond.")
+            else:
+                print(f"   [FAIL] DB Pos: {db_pos[:3]}... vs Target")
+                print("LanceDB Position mismatch")
+                
+            if torch.allclose(db_vel, target_vel, atol=1e-4):
+                print("   [OK] LanceDB Velocité correspond.")
+            else:
+                print("LanceDB Velocity mismatch")
+
+        print("\n[SUCCESS] TEST D'INTÉGRITÉ done.")
+        
 
 if __name__ == "__main__":
     
@@ -6373,5 +8183,3 @@ if __name__ == "__main__":
         # Peu importe si on a 1 cerveau, 10 threads ou si ça a planté,
         # la Config connait tout le monde et éteint la lumière.
         GenesisConfig.global_shutdown()
-
-
