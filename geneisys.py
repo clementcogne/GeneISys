@@ -60,11 +60,45 @@ This is a personal hobby project developed during my free time. It is shared
 While feedback and discussions are welcome (via LinkedIn), please understand 
 that maintenance, feature requests, and bug fixes depend entirely on the 
 author's availability. There is no pressure or timeline for updates.
+--------------------------------------------------------------------------------
+TERMINOLOGY & PARADIGM SHIFT (BIOLOGY VS TRADITIONAL AI)
+--------------------------------------------------------------------------------
+NOTE FROM THE AUTHOR:
+Coming from a background in Biology, I deliberately chose a bio-mimetic lexicon 
+for GeneISys. This is not a lack of knowledge of standard AI terminology, but a 
+design choice to reflect the dynamic, homeostatic, and organic nature of this 
+engine, which differs fundamentally from static backpropagation models.
 
+Below is a translation table for AI Researchers to map GeneISys concepts to 
+standard Computer Science / Machine Learning equivalents.
+
++---------------------+-----------------------------+----------------------------------+
+| GENEISYS TERM       | STANDARD AI EQUIVALENT      | IMPLEMENTATION IN CODE           |
++=====================+=============================+==================================+
+| Gravity Engine      | Attention Mechanism / GNN   | ChunkedGravityEngine.step()      |
+|                     | (Self-Attention w/ Physics) |                                  |
++---------------------+-----------------------------+----------------------------------+
+| Metabolism / Decay  |Weight Decay / Regularization| HybridMemoryCluster.decay()      |
+|                     | & Forgetting Gate (LSTM)    |                                  |
++---------------------+-----------------------------+----------------------------------+
+| FractalNode         | Embedding / Vector Token    | class FractalNode                |
+|                     | + Metadata Container        |                                  |
++---------------------+-----------------------------+----------------------------------+
+|Bridges (Heavy/Light)| DataLoader / Pre-processing | class GenesisBridge (IO)         |
+|                     | Pipeline (Async)            |                                  |
++---------------------+-----------------------------+----------------------------------+
+| Active Inference    | Loss Minimization / RL      | UnifiedBrain.internal_monologue()|
+|(Energy Minimization)| (Prediction Error Loop)     |                                  |
++---------------------+-----------------------------+----------------------------------+
+| Homeostasis         | Convergence / Equilibrium   | physics_kernel (Stability Check) |
++---------------------+-----------------------------+----------------------------------+
+|Sleep / Consolidation| Offline Training / Fine-    | UnifiedBrain.sleep()             |
+|                     | tuning / Checkpointing      |                                  |
++---------------------+-----------------------------+----------------------------------+
 ================================================================================
 """
 
-strVersion = "0.0.96_16_15_06nQ_23_STABLE_alpha"
+strVersion = "0.0.96_16_15_06nQ_26_STABLE_alpha"
 
 
 import torch
@@ -165,7 +199,7 @@ class GenesisConfig:
     # --- REGISTRE DES THREADS ACTIFS (Pattern Pool) ---
     RUNNING_THREADS = []
 
-    def __init__(self, dim=4096, shard_count=5, PrecisionType="FP32", ForceCPU = False,str_version=f'GENEISIS MVP{strVersion} (Performance & Hardening)', ENABLE_MULTITHREADING = True, FORCE_LIGHT_MODE = False, SPATIAL_DIM=128, CUDA_GRAPH_WINDOW_SIZE = 4096):
+    def __init__(self, dim=4096, shard_count=5, PrecisionType="FP32", ForceCPU = False,str_version=f'GENEISIS MVP{strVersion} (Performance & Hardening)', ENABLE_MULTITHREADING = True, FORCE_LIGHT_MODE = False, SPATIAL_DIM=128, CUDA_GRAPH_WINDOW_SIZE = 4096, CUDA_GRAPH_UNACTIVE=False):
         if ForceCPU:
             self.DEVICE = torch.device("cpu")
         else:
@@ -175,7 +209,7 @@ class GenesisConfig:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
             # ------------------------
-         
+        self.CUDA_GRAPH_UNACTIVE = CUDA_GRAPH_UNACTIVE
             
         self.STR_VERSION = str_version
         self.BASE_MEM_DIR = f'./memoire_GeneISys_vn{strVersion}'
@@ -1457,7 +1491,7 @@ class ChunkedGravityEngine:
             chunk_forces_movement = None
 
             
-            if use_cuda_graph:
+            if use_cuda_graph and not CFG.CUDA_GRAPH_UNACTIVE:
                 # === CHEMIN A : CUDA GRAPH ===
                 
                 # A. Remplissage des Inputs (Camion Benne)
@@ -1481,7 +1515,8 @@ class ChunkedGravityEngine:
 
                 # C. Padding (Nettoyage)
                 if current_batch_size < win_size:
-                    self.graph_pos[current_batch_size:].fill_(100000.0)
+                    safe_infinity = 30000.0 if CFG.COMPUTE_DTYPE == torch.half else 100000.0
+                    self.graph_pos[current_batch_size:].fill_(safe_infinity)
                     self.graph_mass[current_batch_size:].fill_(0)
                     self.graph_vecs[current_batch_size:].fill_(0)
                     self.graph_vels[current_batch_size:].fill_(0)
@@ -2920,8 +2955,6 @@ class MatrixEncoder(nn.Module):
         vectors = self.projection[padded_ids_gpu % self.projection.shape[0]]
         
         
-        
-        
         # 3. Encodage Positionnel "Standard" (Le remplacement des nombres magiques)
         # On génère la matrice de position [MaxLen, Dim]
         pos_encoding = self._get_sinusoidal_encoding(max_len, self.dim, CFG.DEVICE)
@@ -2991,7 +3024,7 @@ class MatrixEncoder(nn.Module):
         return Quantizer.from_storage(self.semantic_map[key_concept])
 
     def learn_attraction(self, wa, wb, force=0.1, layer_type_wa=0, layer_type_wb=0):
-        f = force * self.brain.temperature; va = self.get_semantic_vector(wa); vb = self.get_semantic_vector(wb); tgt = F.normalize(va+vb, p=2, dim=0, eps=CFG.EPSILON)
+        f = force * self.brain.temperature; va = self.get_semantic_vector(wa, layer_type_wa); vb = self.get_semantic_vector(wb, layer_type_wb); tgt = F.normalize(va+vb, p=2, dim=0, eps=CFG.EPSILON)
         elasticity = CFG.ELASTICITY_ATTRACTION
         if wa not in self.locked_words: 
             ra = (self.encode_word(wa, layer_type_wa) - va) * elasticity; ma = (tgt - va) * f
@@ -3095,8 +3128,8 @@ class MatrixEncoder(nn.Module):
     def learn_repulsion(self, wa, wb, force=0.1, layer_type_wa=0, layer_type_wb=0):
         if wa in self.locked_words: return
         
-        va = self.get_semantic_vector(wa)
-        vb = self.get_semantic_vector(wb)
+        va = self.get_semantic_vector(wa, layer_type_wa)
+        vb = self.get_semantic_vector(wb, layer_type_wb)
         
         # Calcul de la répulsion
         ra = (self.encode_word(wa, layer_type_wa) - va) * CFG.ELASTICITY_ATTRACTION
@@ -3730,7 +3763,7 @@ class GenesisBridge(threading.Thread):
     def stop(self):
         self.stop_event.set()
 
-    def process_data(self, raw_data):
+    def process_data(self, raw_data, SensoryStreamObj = None):
         raise NotImplementedError
 
     def run(self):
@@ -3826,7 +3859,7 @@ class TextIngestionBridge(GenesisBridge):
                 
         return processed_items
 
-    def process_data(self, text_batch):
+    def process_data(self, text_batch, SensoryStreamObj = None):
         """Point d'entrée pour le Light Bridge (Thread)."""
         # 1. Préparation CPU (Réutilisation de la logique coeur)
         items = self.process_cpu_batch(text_batch)
@@ -3844,7 +3877,11 @@ class TextIngestionBridge(GenesisBridge):
                     "tokens": item["tokens"],
                     "count": len(vecs)
                 }
-                self.out_q.put(packet)
+                
+                if SensoryStreamObj is None:
+                    self.out_q.put(packet)
+                else:
+                    SensoryStreamObj._consume_physics_packet(packet)
         return None
         
 class TextIngestionHeavyBridge(GenesisBridge):
@@ -4100,6 +4137,7 @@ class SensoryStream:
         self.velocities_buffer = torch.zeros((self.MAX_LEN, CFG.SPATIAL_DIM), dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         self.masses_buffer = torch.zeros(self.MAX_LEN, dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         self.layer_buffer = torch.zeros(self.MAX_LEN, dtype=torch.long, device=CFG.DEVICE)
+        self.uid_buffer = torch.zeros(self.MAX_LEN, dtype=torch.long, device=CFG.DEVICE)
         self.word_tokens = [""] * self.MAX_LEN 
         self.active_count = 0
         self.time_step = 0
@@ -4145,7 +4183,8 @@ class SensoryStream:
         self.layer_type = layer_type
 
         # --- CAS 1 : THREADING ACTIF (Clean & Simple) ---
-        if self.bridge and (mode == "TRAINING" or mode == "REALITY"):
+        #if self.bridge and (mode == "TRAINING" or mode == "REALITY"):
+        if self.bridge:
             
             # 1. On envoie les données
             self.bridge.in_q.put(token_list_raw)
@@ -4172,7 +4211,10 @@ class SensoryStream:
                         break
         # --- CAS 2 : SÉQUENTIEL (Fallback) ---
         else:
-            self._process_sequential_legacy(token_list_raw)
+            #print("[DEBUG]: monothread")
+            result = self.seq_processor.process_data(token_list_raw, SensoryStreamObj = self)
+            #processed_items = self.seq_processor.process_cpu_batch(raw_lines)
+            #self._process_sequential_legacy(token_list_raw)
             
     
     def flush__(self):
@@ -4330,54 +4372,6 @@ class SensoryStream:
         # Reset
         self.active_count = 0
 
-    def _process_sequential_legacy(self, token_list_raw):
-        """
-        Mode Séquentiel (Fallback / Debug).
-        [ALIGNEMENT] Utilise le "Logic Core" (TextIngestionBridge) pour garantir
-        le même découpage et chunking que les modes Parallèles.
-        """
-        # 1. Conversion en liste de lignes (format attendu par process_cpu_batch)
-        if isinstance(token_list_raw, str):
-            raw_lines = [token_list_raw]
-        else:
-            raw_lines = token_list_raw
-            
-        # 2. Utilisation du Processeur Unique (Plus d'instanciation ici !)
-        # Le processeur est déjà prêt dans self.seq_processor
-        
-        # 3. Traitement Standardisé (Nettoyage + Split + Chunking)
-        processed_items = self.seq_processor.process_cpu_batch(raw_lines)
-        
-        # 4. Exécution Séquentielle
-        for item in processed_items:
-            tokens = item["tokens"]
-            if not tokens: continue
-            
-            # Encodage GPU (Direct, on est sur le Main Thread)
-            vecs, weights = self.brain.encoder.encode_batch_fast(tokens)
-            
-            # Pas besoin de check de taille ici, process_cpu_batch a déjà fait le Chunking (128)
-            n_words = len(tokens)
-            
-            # Mise à jour Stats (pour parité avec les workers)
-            self.brain.encoder.stats.usage.update(item["counts"])
-
-            # Injection Buffer
-            self.active_count = n_words
-            self.vecs_buffer[:n_words] = vecs.to(dtype=CFG.COMPUTE_DTYPE)
-            self.weights_buffer[:n_words] = weights.to(dtype=CFG.COMPUTE_DTYPE)
-            self.positions_buffer[:n_words] = vecs.to(dtype=CFG.COMPUTE_DTYPE)
-            
-            # Mise à jour Token Strings
-            for i, w in enumerate(tokens): 
-                self.word_tokens[i] = w 
-            
-            # Apprentissage & Physique
-            self.brain.memory.update_batch(tokens, vecs)
-            self._process_buffer_vectorized()
-            
-            # Reset
-            self.active_count = 0
 
     def _generate_attention_mask(self, n):
         mask = torch.ones((n, n), device=CFG.DEVICE, dtype=CFG.COMPUTE_DTYPE)
@@ -4486,6 +4480,7 @@ class SensoryStream:
             c = self.brain.ensure_node_in_layer(token, target_layer_base)
             if c:
                 self.layer_buffer[i] = c.layer_type
+                self.uid_buffer[i] = c.uid
                 if (hardware := c.get_hardware_function()):
                     ops[i] = hardware
                     # L'opérateur écrase la masse sémantique (Priorité absolue)
@@ -4548,7 +4543,7 @@ class SensoryStream:
         # Comme 'current_words' est aligné avec 'pos_slice', on peut itérer.
         # Pour aller VITE, on suppose que les indices du buffer correspondent aux positions chargées.
         # Mais pour être 100% sûr, on refait un lookup rapide.
-        
+        """
         for i, word in enumerate(current_words):
             # On récupère le noeud (le buffer layer_buffer contient le bon layer type)
             layer = self.layer_buffer[i].item()
@@ -4558,6 +4553,21 @@ class SensoryStream:
                 # Écriture dans la mémoire globale (Persistance)
                 self.brain.memory_positions[node.uid] = pos_slice[i]
                 self.brain.memory_velocities[node.uid] = vel_slice[i]
+        """
+        # A. On récupère les IDs concernés
+        # active_uids doit être un LongTensor sur le même Device que la mémoire
+        active_uids = self.uid_buffer[:n]
+        
+        # B. Écriture de masse des POSITIONS (1 seule commande)
+        # "Prends les valeurs de pos_slice et mets-les aux indices active_uids"
+        #self.brain.memory_positions.index_copy_(0, active_uids, pos_slice.to(torch.float16))
+        self.brain.memory_positions.index_copy_(0, active_uids, pos_slice)
+        
+        
+        # C. Écriture de masse des VÉLOCITÉS (1 seule commande)
+        # C'est la ligne que tu as justement réclamée !
+        #self.brain.memory_velocities.index_copy_(0, active_uids, vel_slice.to(torch.float16))
+        self.brain.memory_velocities.index_copy_(0, active_uids, vel_slice)
         
         # ----------------------------------------------------
 
@@ -4925,12 +4935,12 @@ class UnifiedBrain:
         
         
         # --- MODIFICATION V1.0 PHYSIQUE ---
-        self.memory_positions = torch.zeros((self.max_nodes, self.spatial_dim), device=CFG.DEVICE)
+        self.memory_positions = torch.zeros((self.max_nodes, self.spatial_dim), dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         # [NOUVEAU] Stockage Vitesse (V1.0)
-        self.memory_velocities = torch.zeros((self.max_nodes, self.spatial_dim), device=CFG.DEVICE)
+        self.memory_velocities = torch.zeros((self.max_nodes, self.spatial_dim), dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         # [NOUVEAU] SNAPSHOT DE REFERENCE (Pour le Dirty Check)
         # Stocke la position telle qu'elle était au dernier chargement disque.
-        self.snapshot_positions = torch.zeros((self.max_nodes, self.spatial_dim), device=CFG.DEVICE)
+        self.snapshot_positions = torch.zeros((self.max_nodes, self.spatial_dim), dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         
         
         # [NOUVEAU] Initialisation Physique & Outils
@@ -8026,8 +8036,8 @@ class GenesisDiagnostic:
         
         # Valeurs cibles arbitraires (qu'on veut retrouver sur le disque)
         # On met des valeurs très reconnaissables (ex: 999.0)
-        target_pos = torch.full((CFG.SPATIAL_DIM,), 999.0, device=CFG.DEVICE)
-        target_vel = torch.full((CFG.SPATIAL_DIM,), -5.0, device=CFG.DEVICE)
+        target_pos = torch.full((CFG.SPATIAL_DIM,), 999.0, dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
+        target_vel = torch.full((CFG.SPATIAL_DIM,), -5.0, dtype=CFG.COMPUTE_DTYPE, device=CFG.DEVICE)
         
         # A. On modifie la mémoire vive (HOT)
         self.brain.memory_positions[uid] = target_pos
@@ -8092,13 +8102,13 @@ class GenesisDiagnostic:
             db_pos = torch.tensor(row["pos"], device=CFG.DEVICE)
             db_vel = torch.tensor(row["vel"], device=CFG.DEVICE)
             
-            if torch.allclose(db_pos, target_pos, atol=1e-4):
+            if torch.allclose(db_pos.to(target_pos.dtype), target_pos, atol=1e-4):
                 print("   [OK] LanceDB Position correspond.")
             else:
                 print(f"   [FAIL] DB Pos: {db_pos[:3]}... vs Target")
                 print("LanceDB Position mismatch")
                 
-            if torch.allclose(db_vel, target_vel, atol=1e-4):
+            if torch.allclose(db_vel.to(target_vel.dtype), target_vel, atol=1e-4):
                 print("   [OK] LanceDB Velocité correspond.")
             else:
                 print("LanceDB Velocity mismatch")
@@ -8108,24 +8118,25 @@ class GenesisDiagnostic:
 
 if __name__ == "__main__":
     
-    Nb_DIM = 4096 #tested for: 64, 128, 256, 512, 1024, 2048, 4096
+    Nb_DIM = 4096 #tested for: 64, 128, 256, 512, 1024, 2048, 4096    #default value: 4096 
     # N11: CONFIGURATION DE PRÉCISION (Point 3)
     # Options: "INT8", "FP16", "FP32"
-    strPRECISION_MODE = "FP32"
-    boolForceCPU = False # false for CUDA auto-detection and True to force CPU (CUDA unactivation)
+    strPRECISION_MODE = "FP32" #default value: "FP32" 
+    boolForceCPU = False # false for CUDA auto-detection and True to force CPU (CUDA unactivation), default value: False 
     #boolForceCPU = True
+    boolcuda_graph_desactivation = False  # unactivate cuda graph, default value: False 
     str_lang = "fr" 
-    boolResetBase = False
-    boolENABLE_MULTITHREADING = True #active le threading
-    boolFORCE_LIGHT_MODE = True #desactive le Multiprocess
-    #boolResetBase = True # to reset database at start
+    boolResetBase = False #reset database, default value: False
+    #boolResetBase = True # to reset database at start, default value: False
+    boolENABLE_MULTITHREADING = True #active le threading, default value: True
+    boolFORCE_LIGHT_MODE = True #desactive le Multiprocess, default value: True 
     RUN_MODE = "DIAGNOSTIC" 
     #RUN_MODE = "LIFE_LOOP" 
     #RUN_MODE = "TRAINING_FILE" 
     #RUN_MODE = "IMPORT_MODEL" 
     #RUN_MODE = "INFERENCE" 
     
-    CFG = GenesisConfig(dim=Nb_DIM, PrecisionType = strPRECISION_MODE, ForceCPU=boolForceCPU, ENABLE_MULTITHREADING=boolENABLE_MULTITHREADING,FORCE_LIGHT_MODE=boolFORCE_LIGHT_MODE)
+    CFG = GenesisConfig(dim=Nb_DIM, PrecisionType = strPRECISION_MODE, ForceCPU=boolForceCPU, ENABLE_MULTITHREADING=boolENABLE_MULTITHREADING,FORCE_LIGHT_MODE=boolFORCE_LIGHT_MODE, CUDA_GRAPH_UNACTIVE =boolcuda_graph_desactivation)
     # --- INSTANCE GLOBALE LOGGER ---
     LOGGER = GenesisAsyncLogger()
     LOGGER.start()
